@@ -33,7 +33,7 @@ state = {
     'z': 0,
     'click_x': None, 'click_y': None,       
     'target_x': None, 'target_y': None, 'target_z': None, 
-    'mask': None,
+    'mask': None, # uint16 Instance Mask
     'shaft_barrier': None,
     
     'painted_barrier_2d': None,
@@ -42,6 +42,9 @@ state = {
     
     'saved_targets': [], 
     'target_counter': 1,
+    'is_correction_mode': False,
+    'loaded_df': None,
+    
     'texts_ax1': [],
     'texts_ax2': [],
     'dots_ax1': [],
@@ -98,7 +101,6 @@ brush_circle_ax1 = plt.Circle((0, 0), 1, color='cyan', fill=False, linewidth=1.5
 brush_circle_ax2 = plt.Circle((0, 0), 1, color='cyan', fill=False, linewidth=1.5, visible=False)
 ax1.add_patch(brush_circle_ax1)
 ax2.add_patch(brush_circle_ax2)
-
 ax1.set_title("Z-Slice Navigator")
 
 mip_display = ax2.imshow(dummy_img, cmap='gray')
@@ -109,12 +111,13 @@ target_marker_mip, = ax2.plot([], [], 'c+', markersize=15, markeredgewidth=2)
 ax2.set_title("Global MIP (L-Click: Select | R-Click: Remove)")
 
 # --- Widgets ---
-input_folder_input = widgets.Text(placeholder='C:/Path/To/Folder', description='Input Folder:', layout=widgets.Layout(width='360px'))
-load_folder_btn = widgets.Button(description='Load Remaining', button_style='primary', icon='folder-open', layout=widgets.Layout(width='150px'))
+input_folder_input = widgets.Text(placeholder='C:/Path/To/Folder', description='Input Folder:', layout=widgets.Layout(width='370px'))
+load_folder_btn = widgets.Button(description='Load Remaining', button_style='primary', icon='folder-open', layout=widgets.Layout(width='120px'))
+load_analyzed_btn = widgets.Button(description='Load Analyzed', button_style='warning', icon='folder-open', layout=widgets.Layout(width='120px'))
+batch_unattended_btn = widgets.Button(description='Batch Unattended', button_style='danger', icon='rocket', layout=widgets.Layout(width='120px'))
 file_info_label = widgets.Label(value="No folder loaded")
 
 mask_source_dropdown = widgets.Dropdown(options=['SWC Mask', 'Geo Mask', 'Respan Mask'], value='SWC Mask', description='Mask Source:', layout=widgets.Layout(width='360px'))
-
 mode_radio = widgets.RadioButtons(options=['Target Spines', 'Paint Barrier', 'Erase Barrier'], value='Target Spines', description='Mode:', layout=widgets.Layout(width='160px'))
 brush_size_slider = widgets.IntSlider(value=8, min=2, max=40, description='Brush Size:', style={'description_width': '80px'}, layout=widgets.Layout(width='230px'))
 clear_paint_btn = widgets.Button(description='Clear Paint', button_style='danger', icon='eraser', layout=widgets.Layout(width='110px'))
@@ -134,8 +137,8 @@ hessian_sigma_slider = widgets.FloatSlider(value=1.5, min=0.5, max=4.0, step=0.1
 show_targets_cb = widgets.Checkbox(value=True, description='Show Markers', indent=False, layout=widgets.Layout(width='140px'))
 show_mask_cb = widgets.Checkbox(value=True, description='Show Segment', indent=False, layout=widgets.Layout(width='140px'))
 
-target_list_ui = widgets.SelectMultiple(options=[], description='Target List:', style={'description_width': 'initial'}, layout={'width': '365px', 'height': '150px'})
-delete_target_btn = widgets.Button(description='Delete Selected Targets', button_style='danger', icon='trash', layout=widgets.Layout(width='365px'))
+target_list_ui = widgets.SelectMultiple(options=[], description='Target List:', style={'description_width': 'initial'}, layout={'width': '370px', 'height': '150px'})
+delete_target_btn = widgets.Button(description='Delete Selected Targets', button_style='danger', icon='trash', layout=widgets.Layout(width='370px'))
 
 status_dropdown = widgets.Dropdown(options=['static', 'new', 'eliminated'], value='static', description='Status:', layout=widgets.Layout(width='180px'))
 apply_status_btn = widgets.Button(description='Apply Status', button_style='info', icon='check', layout=widgets.Layout(width='180px'))
@@ -157,10 +160,10 @@ reset_view_btn = widgets.Button(description='Reset View (a)', button_style='', i
 zoom_rect_btn = widgets.Button(description='Zoom Rect (f)', button_style='', icon='search', layout=widgets.Layout(width='180px'))
 pan_btn = widgets.Button(description='Pan Image (d)', button_style='', icon='arrows', layout=widgets.Layout(width='180px'))
 
-analyze_all_btn = widgets.Button(description='Analyze All Targets', button_style='success', icon='cogs', layout=widgets.Layout(width='365px'))
-next_image_btn = widgets.Button(description='Next Image >', button_style='primary', icon='arrow-right', layout=widgets.Layout(width='365px'))
+analyze_all_btn = widgets.Button(description='Analyze & Save Targets', button_style='success', icon='cogs', layout=widgets.Layout(width='370px'))
+next_image_btn = widgets.Button(description='Next Image >', button_style='primary', icon='arrow-right', layout=widgets.Layout(width='370px'))
 
-custom_id_input = widgets.Text(placeholder='Override Start ID...', description='Custom ID:', layout=widgets.Layout(width='365px'))
+custom_id_input = widgets.Text(placeholder='Override Start ID...', description='Custom ID:', layout=widgets.Layout(width='370px'))
 
 log_output = widgets.Output()
 
@@ -171,12 +174,10 @@ def get_effective_barrier():
     base = state['shaft_barrier'] if state['shaft_barrier'] is not None else np.zeros_like(state['raw_stack'], dtype=bool)
     painted_3d = np.broadcast_to(state['painted_barrier_2d'], base.shape) if state['painted_barrier_2d'] is not None else np.zeros_like(base)
     erased_3d = np.broadcast_to(state['erased_barrier_2d'], base.shape) if state['erased_barrier_2d'] is not None else np.zeros_like(base)
-    
     effective = (base | painted_3d) & (~erased_3d)
     return effective
 
 def get_2d_hessian_blob_mask(V_sub, strictness, sig=1.5):
-    """Applies a 2D Hessian filter slice-by-slice to avoid Z-axis anisotropy distortion."""
     mask = np.zeros_like(V_sub, dtype=bool)
     for zi in range(V_sub.shape[0]):
         slice_v = V_sub[zi].astype(float)
@@ -207,7 +208,6 @@ def apply_mask_source():
     
     val = mask_source_dropdown.value
     raw_stack = state['raw_stack']
-    
     dist_3d = np.inf * np.ones_like(raw_stack)
     d_len = 0.0
     
@@ -237,10 +237,10 @@ def apply_mask_source():
                     dist_3d = np.broadcast_to(dist_2d, raw_stack.shape).copy()
                 elif loaded_mask.ndim == 3:
                     if loaded_mask.shape != raw_stack.shape:
-                        print(f"⚠️ Mask shape {loaded_mask.shape} mismatches image {raw_stack.shape}. Attempting direct processing.")
+                        print(f"⚠️ Mask shape mismatches image. Attempting direct processing.")
                     dist_3d = distance_transform_edt(~loaded_mask, sampling=[dz, dy, dx])
                 
-                print("💡 Tip: Set 'Barrier µm' slider to 0.0 if you want to use the exact pre-calculated mask without dilation.")
+                print("💡 Tip: Set 'Barrier µm' slider to 0.0 if you want to use exact pre-calculated mask.")
             else:
                 print(f"⚠️ No {val} file found matching '{pattern}'. Barrier disabled.")
                 
@@ -259,7 +259,6 @@ def on_mask_source_change(change):
     val = change['new']
     if val in ['Geo Mask', 'Respan Mask']:
         barrier_slider.value = 0.0
-        
     if state['raw_stack'] is not None:
         apply_mask_source()
         refresh_display()
@@ -269,7 +268,6 @@ def find_optimal_xyz(x, y, search_radius=5, start_z=None):
         return state['z'] if start_z is None else start_z, y, x
         
     stack = state['base_smoothed_stack']
-    
     y_min = max(0, y - search_radius)
     y_max = min(stack.shape[1], y + search_radius + 1)
     x_min = max(0, x - search_radius)
@@ -294,27 +292,22 @@ def find_optimal_xyz(x, y, search_radius=5, start_z=None):
     
     eff_barrier_3d = get_effective_barrier()
     eff_bar_sub = eff_barrier_3d[z_min:z_max, y_min:y_max, x_min:x_max]
-    
     sub_volume[eff_bar_sub] = -1e9
             
-    if np.all(sub_volume == -1e9):
-        return best_z, y, x 
+    if np.all(sub_volume == -1e9): return best_z, y, x 
     
     max_idx = np.argmax(sub_volume)
     z_loc, dy_loc, dx_loc = np.unravel_index(max_idx, sub_volume.shape)
     
-    opt_z = int(z_min + z_loc)
-    opt_y = int(y_min + dy_loc)
-    opt_x = int(x_min + dx_loc)
-    
-    return opt_z, opt_y, opt_x
+    return int(z_min + z_loc), int(y_min + dy_loc), int(x_min + dx_loc)
 
-def auto_generate_seeds(b=None):
+def auto_generate_seeds(b=None, silent=False):
     if state['raw_stack'] is None: return
     
-    with log_output:
-        clear_output()
-        print("🔍 Running background subtraction & geodesic filtering for auto-seeding...")
+    if not silent:
+        with log_output:
+            clear_output()
+            print("🔍 Running background subtraction & geodesic filtering for auto-seeding...")
         
     state['saved_targets'] = []
     
@@ -322,16 +315,14 @@ def auto_generate_seeds(b=None):
     if custom_val.isdigit():
         state['target_counter'] = int(custom_val)
         custom_id_input.value = ''
-    else:
+    elif not state['is_correction_mode']:
         state['target_counter'] = 1
         
     target_list_ui.options = []
-        
     mip_img = np.max(state['raw_stack'], axis=0)
     
     background = uniform_filter(mip_img.astype(float), size=50)
     bg_subtracted = np.clip(mip_img.astype(float) - background, 0, None)
-    
     smoothed = gaussian(bg_subtracted, sigma=1.5)
     
     if smoothed.max() > 0:
@@ -364,24 +355,26 @@ def auto_generate_seeds(b=None):
             opt_z, opt_y, opt_x = find_optimal_xyz(x_loc, y_loc, search_radius=5, start_z=None)
             
             idx = state['target_counter']
-            status = 'static'
+            status = 'new'
             label_text = f"[{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x} ({status})"
             new_targets.append({
                 'idx': idx, 'label': label_text, 
                 'z': opt_z, 'y': opt_y, 'x': opt_x,
                 'click_x': x_loc, 'click_y': y_loc,
                 'target_type': 'spine',
-                'status': status
+                'status': status,
+                'is_modified': True
             })
             state['target_counter'] += 1
             
         state['saved_targets'].extend(new_targets)
         target_list_ui.options = [t['label'] for t in state['saved_targets']]
         
-        with log_output:
-            print(f"✅ Extracted {len(new_targets)} seeds (Filtered out {filtered_count} objects > {max_geo_dist} µm away)!")
+        if not silent:
+            with log_output:
+                print(f"✅ Extracted {len(new_targets)} seeds (Filtered out {filtered_count} objects > {max_geo_dist} µm away)!")
             
-    refresh_display()
+    if not silent: refresh_display()
 
 def load_csv_seeds(seed_type):
     if state['raw_stack'] is None: return
@@ -392,7 +385,6 @@ def load_csv_seeds(seed_type):
     if base_name.endswith('.tif'): base_name = os.path.splitext(base_name)[0]
     
     suffix = "seeds_2-respan" if seed_type == 'seed2' else "seeds_3-respan"
-    
     search_path = os.path.join(dir_name, f"{base_name}*{suffix}*.csv")
     matches = glob(search_path)
     if not matches:
@@ -423,12 +415,12 @@ def load_csv_seeds(seed_type):
             if custom_val.isdigit():
                 state['target_counter'] = int(custom_val)
                 custom_id_input.value = ''
-            else:
+            elif not state['is_correction_mode']:
                 state['target_counter'] = 1
                 
             target_list_ui.options = []
-            
             loaded_count = 0
+            
             for _, row in df.iterrows():
                 x_loc = int(round(row[x_col]))
                 y_loc = int(round(row[y_col]))
@@ -439,7 +431,7 @@ def load_csv_seeds(seed_type):
                 opt_z, opt_y, opt_x = find_optimal_xyz(x_loc, y_loc, search_radius=5, start_z=None)
                 
                 idx = state['target_counter']
-                status = 'static'
+                status = 'new'
                 label_text = f"[{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x} ({status})"
                 
                 state['saved_targets'].append({
@@ -447,7 +439,8 @@ def load_csv_seeds(seed_type):
                     'z': opt_z, 'y': opt_y, 'x': opt_x,
                     'click_x': x_loc, 'click_y': y_loc,
                     'target_type': 'spine',
-                    'status': status
+                    'status': status,
+                    'is_modified': True
                 })
                 state['target_counter'] += 1
                 loaded_count += 1
@@ -473,11 +466,10 @@ def load_image_at_index(idx):
     base_name = os.path.splitext(filename)[0]
     if base_name.endswith('.tif'): base_name = os.path.splitext(base_name)[0]
     
-    custom_barrier_2d_path = os.path.join(out_dir, base_name + '_custom_barrier_2d.tif')
-    
     with log_output:
         clear_output()
-        print(f"Loading {filename}...")
+        mode_str = "Correction Mode" if state.get('is_correction_mode') else "Standard Mode"
+        print(f"Loading {filename} [{mode_str}]...")
         
     raw_stack = imread(filepath)
     state['raw_stack'] = raw_stack
@@ -495,6 +487,7 @@ def load_image_at_index(idx):
     
     apply_mask_source()
 
+    custom_barrier_2d_path = os.path.join(out_dir, base_name + '_custom_barrier_2d.tif')
     if os.path.exists(custom_barrier_2d_path):
         edit_mask = imread(custom_barrier_2d_path)
         state['painted_barrier_2d'] = (edit_mask == 1)
@@ -505,15 +498,63 @@ def load_image_at_index(idx):
         state['erased_barrier_2d'] = np.zeros((h, w), dtype=bool)
 
     state['z'] = 0
-    state['mask'] = np.zeros_like(raw_stack, dtype=bool)
+    state['mask'] = np.zeros_like(raw_stack, dtype=np.uint16)
     state['is_drawing'] = False
-    
     state['click_x'] = state['click_y'] = None
     state['target_x'] = state['target_y'] = state['target_z'] = None
     state['saved_targets'] = []
     state['target_counter'] = 1
+    state['loaded_df'] = None
     custom_id_input.value = ''
-    target_list_ui.options = []
+    
+    # ---------------------------------------------
+    # CORRECTION MODE LOADING LOGIC
+    # ---------------------------------------------
+    if state.get('is_correction_mode', False):
+        csv_path_corr = os.path.join(out_dir, base_name + '_corrected_spine_results.csv')
+        csv_path_orig = os.path.join(out_dir, base_name + '_spine_results.csv')
+        mask_path_corr = os.path.join(out_dir, base_name + '_corrected_segmentation_mask.tif')
+        mask_path_orig = os.path.join(out_dir, base_name + '_segmentation_mask.tif')
+        
+        csv_to_load = csv_path_corr if os.path.exists(csv_path_corr) else csv_path_orig
+        mask_to_load = mask_path_corr if os.path.exists(mask_path_corr) else mask_path_orig
+        
+        if os.path.exists(csv_to_load) and os.path.exists(mask_to_load):
+            with log_output: print(f"📥 Loading analyzed records from {os.path.basename(csv_to_load)}...")
+            df = pd.read_csv(csv_to_load)
+            state['loaded_df'] = df
+            loaded_mask = imread(mask_to_load)
+            
+            if loaded_mask.max() == 255 and len(np.unique(loaded_mask)) <= 2:
+                with log_output: print("⚠️ Legacy binary mask detected. Re-analyze to convert to instance mask for selective deletion.")
+                state['mask'] = (loaded_mask > 0).astype(np.uint16) 
+            else:
+                state['mask'] = loaded_mask.astype(np.uint16)
+            
+            max_id = 0
+            for _, row in df.iterrows():
+                tid = int(row['Target_ID'])
+                max_id = max(max_id, tid)
+                t_type = 'filopodia' if row['Classification'] == 'Filopodia' else 'suboptimal' if row['Classification'] == 'Suboptimal Measures' else 'spine'
+                prefix = "[Filo]" if t_type == 'filopodia' else "[Sub]" if t_type == 'suboptimal' else ""
+                
+                # Fetch original status instead of forcing 'static'
+                orig_status = str(row['Status']) if 'Status' in df.columns else 'static'
+                
+                t_dict = {
+                    'idx': tid,
+                    'z': int(row['Z_Slice']) - 1, 'y': int(row['Corrected_Y']), 'x': int(row['Corrected_X']),
+                    'click_x': int(row['Original_X']), 'click_y': int(row['Original_Y']),
+                    'target_type': t_type, 
+                    'status': orig_status,
+                    'is_modified': False # Flag to bypass re-calculation
+                }
+                t_dict['label'] = f"{prefix} [{tid}] Z:{t_dict['z']+1} Y:{t_dict['y']} X:{t_dict['x']} ({orig_status})".strip()
+                state['saved_targets'].append(t_dict)
+            
+            state['target_counter'] = max_id + 1
+            
+    target_list_ui.options = [t['label'] for t in state['saved_targets']]
     
     z_slider.unobserve_all()
     z_slider.max = raw_stack.shape[0] - 1
@@ -545,8 +586,9 @@ def refresh_display():
     mip_barrier_display.set_data(np.ma.masked_where(~barrier_mip, barrier_mip))
     
     if show_mask_cb.value:
-        mask_display.set_data(np.ma.masked_where(~state['mask'][z], state['mask'][z]))
-        mip_m = np.max(state['mask'], axis=0)
+        z_mask = state['mask'][z] > 0
+        mask_display.set_data(np.ma.masked_where(~z_mask, z_mask))
+        mip_m = np.max(state['mask'], axis=0) > 0
         mip_mask_display.set_data(np.ma.masked_where(~mip_m, mip_m))
     else:
         mask_display.set_data(np.ma.masked_all(state['raw_stack'][z].shape))
@@ -632,7 +674,7 @@ def on_mouse_press(event):
     elif mode_radio.value == 'Target Spines' and event.inaxes in [ax1, ax2]:
         clicked_x, clicked_y = int(round(event.xdata)), int(round(event.ydata))
         
-        if event.button == 3:
+        if event.button == 3: # Right Click Remove
             min_dist = 12
             to_remove = None
             for t in state['saved_targets']:
@@ -642,6 +684,7 @@ def on_mouse_press(event):
                     to_remove = t
                     
             if to_remove:
+                state['mask'][state['mask'] == to_remove['idx']] = 0
                 state['saved_targets'].remove(to_remove)
                 target_list_ui.options = [t['label'] for t in state['saved_targets']]
                 refresh_display()
@@ -655,7 +698,6 @@ def on_mouse_press(event):
             state['click_y'] = clicked_y
             
             opt_z, opt_y, opt_x = find_optimal_xyz(clicked_x, clicked_y, search_radius=5, start_z=state['z'])
-            
             state['target_z'] = opt_z
             state['target_y'] = opt_y
             state['target_x'] = opt_x
@@ -753,94 +795,104 @@ def on_scroll(event):
     refresh_display()
 
 def on_save_target(target_type='spine'):
-    if state['click_x'] is not None and mode_radio.value == 'Target Spines':
-        opt_z, opt_y, opt_x = state['target_z'], state['target_y'], state['target_x']
-        click_x, click_y = state['click_x'], state['click_y']
+    if state['click_x'] is None:
+        with log_output:
+            clear_output()
+            print("⚠️ Please Left-Click on the image to set a spatial target location before saving.")
+        return
         
-        custom_val = custom_id_input.value.strip()
-        if custom_val.isdigit():
-            state['target_counter'] = int(custom_val)
-            custom_id_input.value = ''
-            
-        idx = state['target_counter']
+    if mode_radio.value != 'Target Spines':
+        with log_output:
+            clear_output()
+            print("⚠️ Switch mode to 'Target Spines' to save targets.")
+        return
+
+    opt_z, opt_y, opt_x = state['target_z'], state['target_y'], state['target_x']
+    click_x, click_y = state['click_x'], state['click_y']
+    
+    custom_val = custom_id_input.value.strip()
+    if custom_val.isdigit():
+        state['target_counter'] = int(custom_val)
+        custom_id_input.value = ''
         
-        if target_type == 'filopodia':
-            label_prefix = "[Filo]"
-        elif target_type == 'suboptimal':
-            label_prefix = "[Sub]"
-        else:
-            label_prefix = ""
-            
-        status = 'static'
-        label_text = f"{label_prefix} [{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x} ({status})".strip()
+    idx = state['target_counter']
+    
+    if target_type == 'filopodia': label_prefix = "[Filo]"
+    elif target_type == 'suboptimal': label_prefix = "[Sub]"
+    else: label_prefix = ""
         
-        if not any(t['z'] == opt_z and t['y'] == opt_y and t['x'] == opt_x for t in state['saved_targets']):
-            state['saved_targets'].append({
-                'idx': idx, 'label': label_text, 
-                'z': opt_z, 'y': opt_y, 'x': opt_x,
-                'click_x': click_x, 'click_y': click_y,
-                'target_type': target_type,
-                'status': status
-            })
-            state['target_counter'] += 1
-            target_list_ui.options = [t['label'] for t in state['saved_targets']]
-            
-            with log_output:
-                clear_output()
-                if target_type == 'filopodia': tag = "Filopodia"
-                elif target_type == 'suboptimal': tag = "Suboptimal Spine"
-                else: tag = "Target Spine"
-                print(f"💾 Saved {tag} {idx} at Z:{opt_z+1}, Y:{opt_y}, X:{opt_x} ({status})")
-            
-            refresh_display()
+    status = 'new'
+    label_text = f"{label_prefix} [{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x} ({status})".strip()
+    
+    if not any(t['z'] == opt_z and t['y'] == opt_y and t['x'] == opt_x for t in state['saved_targets']):
+        state['saved_targets'].append({
+            'idx': idx, 'label': label_text, 
+            'z': opt_z, 'y': opt_y, 'x': opt_x,
+            'click_x': click_x, 'click_y': click_y,
+            'target_type': target_type,
+            'status': status,
+            'is_modified': True # Flag ensures 3D calculation is run
+        })
+        state['target_counter'] += 1
+        target_list_ui.options = [t['label'] for t in state['saved_targets']]
+        
+        with log_output:
+            clear_output()
+            tag = "Filopodia" if target_type == 'filopodia' else "Suboptimal Spine" if target_type == 'suboptimal' else "Target Spine"
+            print(f"💾 Added {tag} {idx} at Z:{opt_z+1}, Y:{opt_y}, X:{opt_x} ({status})")
+        
+        refresh_display()
+    else:
+        with log_output:
+            clear_output()
+            print(f"⚠️ Target already exists exactly at Z:{opt_z+1}, Y:{opt_y}, X:{opt_x}. Target omitted to prevent duplicates.")
 
 def on_delete_selected_target(b=None):
     selected_labels = target_list_ui.value
     if selected_labels and state['saved_targets']:
+        removed_count = 0
         for sel_label in selected_labels:
             target_data = next((t for t in state['saved_targets'] if t['label'] == sel_label), None)
             if target_data:
+                state['mask'][state['mask'] == target_data['idx']] = 0
                 state['saved_targets'].remove(target_data)
+                removed_count += 1
                 
         target_list_ui.options = [t['label'] for t in state['saved_targets']]
         refresh_display()
         with log_output:
             clear_output()
-            print(f"🗑️ Deleted {len(selected_labels)} Target(s) from list.")
+            print(f"🗑️ Deleted {removed_count} Target(s) from list.")
 
 def on_rename_target(b=None):
     selected_labels = target_list_ui.value
     new_id_str = rename_id_input.value.strip()
     
     if not selected_labels or len(selected_labels) > 1:
-        with log_output:
-            clear_output()
-            print("⚠️ Please select exactly ONE target from the list to update its ID.")
+        with log_output: clear_output(); print("⚠️ Please select exactly ONE target from the list to update its ID.")
         return
         
     selected_label = selected_labels[0]
-    
     if not new_id_str.isdigit():
-        with log_output:
-            clear_output()
-            print("⚠️ Please enter a valid number for the new ID.")
+        with log_output: clear_output(); print("⚠️ Please enter a valid number for the new ID.")
         return
         
     new_id = int(new_id_str)
     target_data = next((t for t in state['saved_targets'] if t['label'] == selected_label), None)
     
     if target_data:
+        old_id = target_data['idx']
         target_data['idx'] = new_id
+        state['mask'][state['mask'] == old_id] = new_id
         
         t_type = target_data.get('target_type', 'spine')
-        label_prefix = ""
-        if t_type == 'filopodia': label_prefix = "[Filo]"
-        elif t_type == 'suboptimal': label_prefix = "[Sub]"
+        label_prefix = "[Filo]" if t_type == 'filopodia' else "[Sub]" if t_type == 'suboptimal' else ""
             
-        status = target_data.get('status', 'static')
+        status = target_data.get('status', 'new')
         new_label = f"{label_prefix} [{new_id}] Z:{target_data['z']+1} Y:{target_data['y']} X:{target_data['x']} ({status})".strip()
         
         target_data['label'] = new_label
+        target_data['is_modified'] = True # Forces a re-save under the new ID record
         target_list_ui.options = [t['label'] for t in state['saved_targets']]
         target_list_ui.value = (new_label,)
         rename_id_input.value = ''
@@ -855,9 +907,7 @@ def on_apply_status(b=None):
     new_status = status_dropdown.value
     
     if not selected_labels:
-        with log_output:
-            clear_output()
-            print("⚠️ Please select at least one target to apply status.")
+        with log_output: clear_output(); print("⚠️ Please select at least one target to apply status.")
         return
         
     for sel_label in selected_labels:
@@ -866,9 +916,7 @@ def on_apply_status(b=None):
             target_data['status'] = new_status
             
             t_type = target_data.get('target_type', 'spine')
-            label_prefix = ""
-            if t_type == 'filopodia': label_prefix = "[Filo]"
-            elif t_type == 'suboptimal': label_prefix = "[Sub]"
+            label_prefix = "[Filo]" if t_type == 'filopodia' else "[Sub]" if t_type == 'suboptimal' else ""
                 
             new_label = f"{label_prefix} [{target_data['idx']}] Z:{target_data['z']+1} Y:{target_data['y']} X:{target_data['x']} ({new_status})".strip()
             target_data['label'] = new_label
@@ -884,15 +932,14 @@ def on_apply_status(b=None):
 def on_undo_target(b=None):
     if state['saved_targets']:
         removed = state['saved_targets'].pop()
+        state['mask'][state['mask'] == removed['idx']] = 0
         target_list_ui.options = [t['label'] for t in state['saved_targets']]
         refresh_display()
         with log_output:
             clear_output()
             print(f"↩️ Undid Target [{removed['idx']}]. Remaining in queue: {len(state['saved_targets'])}")
     else:
-        with log_output:
-            clear_output()
-            print("⚠️ Queue is already empty.")
+        with log_output: clear_output(); print("⚠️ Queue is already empty.")
 
 def on_key_press(event):
     if event.key == 'z':
@@ -923,18 +970,19 @@ def on_target_selected(change):
         target_data = next((t for t in state['saved_targets'] if t['label'] == selected_label), None)
         if target_data:
             state['target_z'], state['target_y'], state['target_x'] = target_data['z'], target_data['y'], target_data['x']
+            state['click_x'], state['click_y'] = target_data.get('click_x'), target_data.get('click_y')
             state['z'] = target_data['z']
             mode_radio.value = 'Target Spines'
             refresh_display()
 
-def on_analyze_all(b):
+def on_analyze_all(b=None, silent=False):
     if not state['saved_targets'] or state['raw_stack'] is None:
-        with log_output: clear_output(); print("⚠️ Queue is empty. Save targets first.")
+        if not silent:
+            with log_output: clear_output(); print("⚠️ Queue is empty. Save targets first.")
         return
         
     on_save_barrier()
-    
-    combined_mask = np.zeros_like(state['raw_stack'], dtype=bool)
+    combined_mask = state['mask'].copy()
     results_list = []
     
     total_barrier = get_effective_barrier()
@@ -944,177 +992,183 @@ def on_analyze_all(b):
     current_tolerance_val = tol_slider.value
     current_zsearch_val = z_search_slider.value
     
-    with log_output:
-        print(f"⚙️ Batch processing targets using 2.5D Dilated Envelope Extrusion...")
+    if not silent:
+        with log_output:
+            print(f"⚙️ Batch processing targets using 2.5D Dilated Envelope Extrusion...")
         
-        for target in state['saved_targets']:
-            z, y, x, idx = target['z'], target['y'], target['x'], target['idx']
-            orig_x, orig_y = target['click_x'], target['click_y']
+    for target in state['saved_targets']:
+        idx = target['idx']
+        t_type = target.get('target_type', 'spine')
+        
+        # --- Incremental Skip: Bypass recalculation, update status from UI ---
+        if not target.get('is_modified', True) and state['loaded_df'] is not None:
+            row = state['loaded_df'][state['loaded_df']['Target_ID'] == idx].copy()
+            if not row.empty:
+                row_dict = row.iloc[0].to_dict()
+                row_dict['Status'] = target.get('status', row_dict.get('Status', 'static'))
+                row_dict['Classification'] = 'Filopodia' if t_type == 'filopodia' else 'Suboptimal Measures' if t_type == 'suboptimal' else 'Spine'
+                results_list.append(row_dict)
+            continue
             
-            t_type = target.get('target_type', 'spine')
-            if target.get('is_filopodia', False): t_type = 'filopodia'
-            
-            target_status = target.get('status', 'static')
-            
-            geo_dist_um = float(state['dist_field_3d'][z, y, x]) if state['dist_field_3d'] is not None else 0.0
-            if np.isinf(geo_dist_um): geo_dist_um = 0.0
-            
-            if t_type == 'filopodia':
-                results_list.append({
-                    'Target_ID': idx, 
-                    'Classification': 'Filopodia',
-                    'Status': target_status,
-                    'Z_Slice': z + 1, 
-                    'Original_Y': orig_y,
-                    'Original_X': orig_x,
-                    'Corrected_Y': y, 
-                    'Corrected_X': x, 
-                    'Local_Dendrite_Surface_Max': 0,
-                    'Local_Dendrite_Surface_IntDen': 0.0,
-                    'Area_Opt_Z_um2': 0.0,
-                    'Geodesic_Distance_um': geo_dist_um,
-                    'Vol_voxels': 0, 
-                    'Vol_um3': 0.0,
-                    'Max_Intensity': int(state['raw_stack'][z, y, x]),
-                    'Sum_Intensity': 0.0,
-                    'Integrated_Density': 0.0,
-                    'Z_Slices_Count': 0,
-                    'Avg_Initial_Dendrite_Intensity': state['avg_initial_dendrite_intensity'],
-                    'Barrier_um': current_barrier_val,
-                    'Tolerance': current_tolerance_val,
-                    'Z_Search_Range': current_zsearch_val,
-                    'Dendrite_Length_um': state['dendrite_length_um']
-                })
-                continue
-                
-            pad_xy = 30
-            pad_z = current_zsearch_val
-            z_min_loc = max(0, z - pad_z)
-            z_max_loc = min(state['raw_stack'].shape[0], z + pad_z + 1)
-            y_min_loc = max(0, y - pad_xy)
-            y_max_loc = min(state['raw_stack'].shape[1], y + pad_xy + 1)
-            x_min_loc = max(0, x - pad_xy)
-            x_max_loc = min(state['raw_stack'].shape[2], x + pad_xy + 1)
-            
-            lz, ly, lx = z - z_min_loc, y - y_min_loc, x - x_min_loc
-
-            if state['erased_barrier_2d'] is not None and state['erased_barrier_2d'][y, x]:
-                seed_val = state['base_smoothed_stack'][z, y, x]
-            else:
-                seed_val = current_smoothed_stack[z, y, x]
-
-            if seed_val == 0:
-                print(f"❌ Target [{idx}] skipped: Seed is inside the pink dendritic barrier.")
-                continue
-                
-            sub_stack = current_smoothed_stack[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
-            lower_bound = max(seed_val * (1.0 - current_tolerance_val), 1e-6)
-            
-            # --- 1. 2D OPTIMAL SLICE SEGMENTATION ---
-            slice_2d = sub_stack[lz]
-            binary_2d = slice_2d >= lower_bound
-            
-            if use_hessian_cb.value:
-                # Apply 2D curvature check to just this highly focused slice
-                V_slice = np.expand_dims(slice_2d, 0)
-                blob_mask_2d = get_2d_hessian_blob_mask(V_slice, strictness_slider.value, sig=hessian_sigma_slider.value)[0]
-                blob_mask_2d[ly, lx] = True # Protect anchor
-                binary_2d = binary_2d & blob_mask_2d
-                
-            labeled_2d, _ = label(binary_2d)
-            seed_label_2d = labeled_2d[ly, lx]
-            
-            if seed_label_2d == 0:
-                print(f"❌ Target [{idx}] skipped: 2D seed slice failed threshold or topology.")
-                continue
-                
-            spine_mask_2d = (labeled_2d == seed_label_2d)
-            spine_mask_2d = binary_fill_holes(spine_mask_2d)
-            
-            # --- 2. THE DILATED ENVELOPE (2.5D Extrusion) ---
-            # Dilate the 2D mask by 3 pixels to allow for spine tilt/width variation
-            dilated_2d = binary_dilation(spine_mask_2d, iterations=3)
-            # Extrude into a vertical bounding column
-            envelope_3d = np.broadcast_to(dilated_2d, sub_stack.shape)
-            
-            # --- 3. BOUNDED 3D SEGMENTATION ---
-            local_binary = sub_stack >= lower_bound
-            
-            if use_hessian_cb.value:
-                blob_mask_3d = get_2d_hessian_blob_mask(sub_stack, strictness_slider.value, sig=hessian_sigma_slider.value)
-                blob_mask_3d[lz, ly, lx] = True 
-                local_binary = local_binary & blob_mask_3d
-                
-            # Physically bound the 3D growth inside the extruded envelope to kill longitudinal bleeding
-            local_binary = local_binary & envelope_3d
-            
-            labeled_local, _ = label(local_binary)
-            seed_label = labeled_local[lz, ly, lx]
-            
-            if seed_label == 0:
-                print(f"❌ Target [{idx}] skipped: 3D region growing failed inside envelope.")
-                continue
-                
-            local_spine_mask = (labeled_local == seed_label)
-            local_spine_mask = binary_fill_holes(local_spine_mask)
-            
-            global_target_mask = np.zeros_like(combined_mask)
-            global_target_mask[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc] = local_spine_mask
-            
-            classification_label = 'Spine'
-            
-            if t_type == 'spine':
-                combined_mask = np.logical_or(combined_mask, global_target_mask)
-            elif t_type == 'suboptimal':
-                classification_label = 'Suboptimal Measures'
-            
-            voxels = np.sum(global_target_mask)
-            vol = voxels * voxel_volume
-            max_intensity = int(state['raw_stack'][global_target_mask].max())
-            sum_intensity = np.sum(state['raw_stack'][global_target_mask], dtype=np.float64)
-            int_density = sum_intensity
-            z_slices_count = int(np.sum(np.any(global_target_mask, axis=(1, 2))))
-            
-            area_opt_z_voxels = np.sum(global_target_mask[z, :, :])
-            area_opt_z_um2 = area_opt_z_voxels * (dx * dy)
-
-            local_barrier = total_barrier[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
-            local_raw = state['raw_stack'][z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
-            
-            local_barrier_surface = local_barrier & ~binary_erosion(local_barrier)
-            
-            if np.any(local_barrier_surface):
-                local_dend_surf_max = int(local_raw[local_barrier_surface].max())
-                local_dend_surf_sum = float(np.sum(local_raw[local_barrier_surface]))
-            else:
-                local_dend_surf_max = 0
-                local_dend_surf_sum = 0.0
-            
+        z, y, x = target['z'], target['y'], target['x']
+        orig_x, orig_y = target['click_x'], target['click_y']
+        target_status = target.get('status', 'new')
+        
+        geo_dist_um = float(state['dist_field_3d'][z, y, x]) if state['dist_field_3d'] is not None else 0.0
+        if np.isinf(geo_dist_um): geo_dist_um = 0.0
+        
+        if t_type == 'filopodia':
             results_list.append({
                 'Target_ID': idx, 
-                'Classification': classification_label,
+                'Classification': 'Filopodia',
                 'Status': target_status,
                 'Z_Slice': z + 1, 
                 'Original_Y': orig_y,
                 'Original_X': orig_x,
                 'Corrected_Y': y, 
                 'Corrected_X': x, 
-                'Local_Dendrite_Surface_Max': local_dend_surf_max,
-                'Local_Dendrite_Surface_IntDen': local_dend_surf_sum,
-                'Area_Opt_Z_um2': area_opt_z_um2,
-                'Geodesic_Distance_um': geo_dist_um, 
-                'Vol_voxels': voxels, 
-                'Vol_um3': vol,
-                'Max_Intensity': max_intensity,
-                'Sum_Intensity': sum_intensity,
-                'Integrated_Density': int_density,
-                'Z_Slices_Count': z_slices_count,
+                'Local_Dendrite_Surface_Max': 0,
+                'Local_Dendrite_Surface_IntDen': 0.0,
+                'Area_Opt_Z_um2': 0.0,
+                'Geodesic_Distance_um': geo_dist_um,
+                'Vol_voxels': 0, 
+                'Vol_um3': 0.0,
+                'Max_Intensity': int(state['raw_stack'][z, y, x]),
+                'Sum_Intensity': 0.0,
+                'Integrated_Density': 0.0,
+                'Z_Slices_Count': 0,
                 'Avg_Initial_Dendrite_Intensity': state['avg_initial_dendrite_intensity'],
                 'Barrier_um': current_barrier_val,
                 'Tolerance': current_tolerance_val,
                 'Z_Search_Range': current_zsearch_val,
                 'Dendrite_Length_um': state['dendrite_length_um']
             })
+            continue
+            
+        pad_xy = 30
+        pad_z = current_zsearch_val
+        z_min_loc = max(0, z - pad_z)
+        z_max_loc = min(state['raw_stack'].shape[0], z + pad_z + 1)
+        y_min_loc = max(0, y - pad_xy)
+        y_max_loc = min(state['raw_stack'].shape[1], y + pad_xy + 1)
+        x_min_loc = max(0, x - pad_xy)
+        x_max_loc = min(state['raw_stack'].shape[2], x + pad_xy + 1)
+        
+        lz, ly, lx = z - z_min_loc, y - y_min_loc, x - x_min_loc
+
+        if state['erased_barrier_2d'] is not None and state['erased_barrier_2d'][y, x]:
+            seed_val = state['base_smoothed_stack'][z, y, x]
+        else:
+            seed_val = current_smoothed_stack[z, y, x]
+
+        if seed_val == 0:
+            if not silent: print(f"❌ Target [{idx}] skipped: Seed is inside the pink dendritic barrier.")
+            continue
+            
+        sub_stack = current_smoothed_stack[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
+        lower_bound = max(seed_val * (1.0 - current_tolerance_val), 1e-6)
+        
+        # --- 1. 2D OPTIMAL SLICE SEGMENTATION ---
+        slice_2d = sub_stack[lz]
+        binary_2d = slice_2d >= lower_bound
+        
+        if use_hessian_cb.value:
+            V_slice = np.expand_dims(slice_2d, 0)
+            blob_mask_2d = get_2d_hessian_blob_mask(V_slice, strictness_slider.value, sig=hessian_sigma_slider.value)[0]
+            blob_mask_2d[ly, lx] = True 
+            binary_2d = binary_2d & blob_mask_2d
+            
+        labeled_2d, _ = label(binary_2d)
+        seed_label_2d = labeled_2d[ly, lx]
+        
+        if seed_label_2d == 0:
+            if not silent: print(f"❌ Target [{idx}] skipped: 2D seed slice failed threshold or topology.")
+            continue
+            
+        spine_mask_2d = (labeled_2d == seed_label_2d)
+        spine_mask_2d = binary_fill_holes(spine_mask_2d)
+        
+        # --- 2. THE DILATED ENVELOPE (2.5D Extrusion) ---
+        dilated_2d = binary_dilation(spine_mask_2d, iterations=3)
+        envelope_3d = np.broadcast_to(dilated_2d, sub_stack.shape)
+        
+        # --- 3. BOUNDED 3D SEGMENTATION ---
+        local_binary = sub_stack >= lower_bound
+        
+        if use_hessian_cb.value:
+            blob_mask_3d = get_2d_hessian_blob_mask(sub_stack, strictness_slider.value, sig=hessian_sigma_slider.value)
+            blob_mask_3d[lz, ly, lx] = True 
+            local_binary = local_binary & blob_mask_3d
+            
+        local_binary = local_binary & envelope_3d
+        
+        labeled_local, _ = label(local_binary)
+        seed_label = labeled_local[lz, ly, lx]
+        
+        if seed_label == 0:
+            if not silent: print(f"❌ Target [{idx}] skipped: 3D region growing failed inside envelope.")
+            continue
+            
+        local_spine_mask = (labeled_local == seed_label)
+        local_spine_mask = binary_fill_holes(local_spine_mask)
+        
+        global_target_mask = np.zeros_like(combined_mask, dtype=bool)
+        global_target_mask[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc] = local_spine_mask
+        
+        classification_label = 'Spine'
+        
+        if t_type == 'spine':
+            combined_mask[global_target_mask] = idx
+        elif t_type == 'suboptimal':
+            classification_label = 'Suboptimal Measures'
+        
+        voxels = np.sum(global_target_mask)
+        vol = voxels * voxel_volume
+        max_intensity = int(state['raw_stack'][global_target_mask].max())
+        sum_intensity = np.sum(state['raw_stack'][global_target_mask], dtype=np.float64)
+        int_density = sum_intensity
+        z_slices_count = int(np.sum(np.any(global_target_mask, axis=(1, 2))))
+        
+        area_opt_z_voxels = np.sum(global_target_mask[z, :, :])
+        area_opt_z_um2 = area_opt_z_voxels * (dx * dy)
+
+        local_barrier = total_barrier[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
+        local_raw = state['raw_stack'][z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
+        
+        local_barrier_surface = local_barrier & ~binary_erosion(local_barrier)
+        
+        if np.any(local_barrier_surface):
+            local_dend_surf_max = int(local_raw[local_barrier_surface].max())
+            local_dend_surf_sum = float(np.sum(local_raw[local_barrier_surface]))
+        else:
+            local_dend_surf_max = 0
+            local_dend_surf_sum = 0.0
+        
+        results_list.append({
+            'Target_ID': idx, 
+            'Classification': classification_label,
+            'Status': target_status,
+            'Z_Slice': z + 1, 
+            'Original_Y': orig_y,
+            'Original_X': orig_x,
+            'Corrected_Y': y, 
+            'Corrected_X': x, 
+            'Local_Dendrite_Surface_Max': local_dend_surf_max,
+            'Local_Dendrite_Surface_IntDen': local_dend_surf_sum,
+            'Area_Opt_Z_um2': area_opt_z_um2,
+            'Geodesic_Distance_um': geo_dist_um, 
+            'Vol_voxels': voxels, 
+            'Vol_um3': vol,
+            'Max_Intensity': max_intensity,
+            'Sum_Intensity': sum_intensity,
+            'Integrated_Density': int_density,
+            'Z_Slices_Count': z_slices_count,
+            'Avg_Initial_Dendrite_Intensity': state['avg_initial_dendrite_intensity'],
+            'Barrier_um': current_barrier_val,
+            'Tolerance': current_tolerance_val,
+            'Z_Search_Range': current_zsearch_val,
+            'Dendrite_Length_um': state['dendrite_length_um']
+        })
             
     state['mask'] = combined_mask
     global final_results_df 
@@ -1129,63 +1183,63 @@ def on_analyze_all(b):
     if base_name.endswith('.tif'):
         base_name = os.path.splitext(base_name)[0]
         
-    csv_path = os.path.join(out_dir, base_name + '_spine_results.csv')
-    filtered_img_path = os.path.join(out_dir, base_name + '_filtered.tif')
-    mask_img_path = os.path.join(out_dir, base_name + '_segmentation_mask.tif')
+    prefix = '_corrected' if state.get('is_correction_mode', False) else ''
+        
+    csv_path = os.path.join(out_dir, base_name + f'{prefix}_spine_results.csv')
+    filtered_img_path = os.path.join(out_dir, base_name + f'{prefix}_filtered.tif')
+    mask_img_path = os.path.join(out_dir, base_name + f'{prefix}_segmentation_mask.tif')
     
     final_results_df.to_csv(csv_path, index=False)
     imwrite(filtered_img_path, current_smoothed_stack)
-    imwrite(mask_img_path, combined_mask.astype(np.uint8) * 255)
+    imwrite(mask_img_path, combined_mask.astype(np.uint16))
     
-    show_mask_cb.value = True
-    refresh_display()
-    
-    mip_img_raw = np.max(state['raw_stack'], axis=0)
-    mip_norm = mip_img_raw.astype(float)
-    if mip_norm.max() > mip_norm.min():
-        mip_norm = (255 * (mip_norm - mip_norm.min()) / (mip_norm.max() - mip_norm.min())).astype(np.uint8)
-    else:
-        mip_norm = np.zeros_like(mip_norm, dtype=np.uint8)
+    if not silent:
+        show_mask_cb.value = True
+        refresh_display()
         
-    mip_rgb = np.stack([mip_norm, mip_norm, mip_norm], axis=-1)
-    
-    mip_mask = np.max(combined_mask, axis=0)
-    mip_rgb[mip_mask, 0] = 0   
-    mip_rgb[mip_mask, 1] = 255 
-    mip_rgb[mip_mask, 2] = 0   
-    
-    fig_mip, ax_mip = plt.subplots(figsize=(8, 8), dpi=150)
-    ax_mip.imshow(mip_rgb)
-    ax_mip.axis('off')
-    
-    ax_mip.set_ylim(mip_rgb.shape[0], 0)
-    
-    for _, row in final_results_df.iterrows():
-        rx, ry = int(row['Corrected_X']), int(row['Corrected_Y'])
-        tid = int(row['Target_ID'])
-        
-        c_class = row['Classification']
-        if c_class == 'Filopodia':
-            color = 'cyan'
-        elif c_class == 'Suboptimal Measures':
-            color = 'orange'
+        mip_img_raw = np.max(state['raw_stack'], axis=0)
+        mip_norm = mip_img_raw.astype(float)
+        if mip_norm.max() > mip_norm.min():
+            mip_norm = (255 * (mip_norm - mip_norm.min()) / (mip_norm.max() - mip_norm.min())).astype(np.uint8)
         else:
-            color = 'yellow'
+            mip_norm = np.zeros_like(mip_norm, dtype=np.uint8)
+            
+        mip_rgb = np.stack([mip_norm, mip_norm, mip_norm], axis=-1)
         
-        ax_mip.plot(rx, ry, '.', color=color, label=str(tid))
-        ax_mip.text(rx + 3, ry, str(tid), color=color, fontsize=9, fontweight='bold',
-                    bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', pad=1))
+        mip_mask = np.max(combined_mask, axis=0) > 0
+        mip_rgb[mip_mask, 0] = 0   
+        mip_rgb[mip_mask, 1] = 255 
+        mip_rgb[mip_mask, 2] = 0   
         
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    mip_saved_path = os.path.join(out_dir, base_name + '_mip_segmented.png')
-    fig_mip.savefig(mip_saved_path, bbox_inches='tight', pad_inches=0)
-    plt.close(fig_mip)
-    
-    with log_output:
-        print(f"✅ Batch Analysis Complete! Processed {len(final_results_df)} targets.")
-        print(f"💾 Saved to folder: {os.path.basename(out_dir)}/")
-        print(f"🖼️ Saved segmented MIP image: {base_name}_mip_segmented.png")
-        display(HTML(final_results_df.to_html(index=False)))
+        fig_mip, ax_mip = plt.subplots(figsize=(8, 8), dpi=150)
+        ax_mip.imshow(mip_rgb)
+        ax_mip.axis('off')
+        
+        ax_mip.set_ylim(mip_rgb.shape[0], 0)
+        
+        for _, row in final_results_df.iterrows():
+            rx, ry = int(row['Corrected_X']), int(row['Corrected_Y'])
+            tid = int(row['Target_ID'])
+            
+            c_class = row['Classification']
+            if c_class == 'Filopodia': color = 'cyan'
+            elif c_class == 'Suboptimal Measures': color = 'orange'
+            else: color = 'yellow'
+            
+            ax_mip.plot(rx, ry, '.', color=color, label=str(tid))
+            ax_mip.text(rx + 3, ry, str(tid), color=color, fontsize=9, fontweight='bold',
+                        bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', pad=1))
+            
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        mip_saved_path = os.path.join(out_dir, base_name + '_mip_segmented.png')
+        fig_mip.savefig(mip_saved_path, bbox_inches='tight', pad_inches=0)
+        plt.close(fig_mip)
+        
+        with log_output:
+            print(f"✅ Batch Analysis Complete! Processed {len(final_results_df)} targets.")
+            print(f"💾 Saved to folder: {os.path.basename(out_dir)}/")
+            print(f"🖼️ Saved segmented MIP image: {base_name}_mip_segmented.png")
+            display(HTML(final_results_df.to_html(index=False)))
 
 def on_load_folder(b):
     in_path = input_folder_input.value.strip()
@@ -1209,30 +1263,71 @@ def on_load_folder(b):
             continue
             
         base_name = os.path.splitext(os.path.basename(f))[0]
-        if base_name.endswith('.tif'):
-            base_name = os.path.splitext(base_name)[0]
-        csv_check_path = os.path.join(out_dir, base_name + '_spine_results.csv')
-        if not os.path.exists(csv_check_path):
+        if base_name.endswith('.tif'): base_name = os.path.splitext(base_name)[0]
+            
+        if not os.path.exists(os.path.join(out_dir, base_name + '_spine_results.csv')) and not os.path.exists(os.path.join(out_dir, base_name + '_corrected_spine_results.csv')):
             remaining_files.append(f)
             
     if not remaining_files:
-        with log_output:
-            clear_output()
-            print("🎉 All images in this folder have already been analyzed in 'output_analysis'!")
+        with log_output: clear_output(); print("🎉 All images in this folder have already been analyzed in 'output_analysis'!")
         return
         
     state['files'] = remaining_files
     state['current_idx'] = 0
+    state['is_correction_mode'] = False
     load_image_at_index(0)
+
+def on_load_analyzed_folder(b):
+    in_path = input_folder_input.value.strip()
+    if not os.path.isdir(in_path):
+        with log_output: clear_output(); print("❌ Invalid input folder path.")
+        return
+        
+    out_dir = os.path.join(in_path, 'output_analysis')
+    all_files = sorted(glob(os.path.join(in_path, "*.tif")) + glob(os.path.join(in_path, "*.tiff")))
+    analyzed_files = []
+    
+    for f in all_files:
+        fn = os.path.basename(f).lower()
+        if fn.endswith('_dendrite-geo.tif') or fn.endswith('_dendrite-respan.tif') or fn.endswith('_dendrite-geo.tiff') or fn.endswith('_dendrite-respan.tiff'): continue
+        
+        bn = os.path.splitext(os.path.basename(f))[0]
+        if bn.endswith('.tif'): bn = os.path.splitext(bn)[0]
+        
+        if os.path.exists(os.path.join(out_dir, bn + '_spine_results.csv')) or os.path.exists(os.path.join(out_dir, bn + '_corrected_spine_results.csv')):
+            analyzed_files.append(f)
+            
+    if not analyzed_files:
+        with log_output: clear_output(); print("⚠️ No analyzed files found in the output directory.")
+        return
+        
+    state['files'] = analyzed_files
+    state['current_idx'] = 0
+    state['is_correction_mode'] = True
+    load_image_at_index(0)
+
+def on_batch_unattended(b):
+    on_load_folder(None)
+    if not state['files']: return
+    
+    with log_output:
+        clear_output()
+        print(f"🚀 Starting Unattended Batch Process for {len(state['files'])} files...")
+        
+    for idx in range(len(state['files'])):
+        load_image_at_index(idx)
+        state['current_idx'] = idx
+        auto_generate_seeds(silent=True)
+        on_analyze_all(silent=True)
+        
+    with log_output: print("🎉 Unattended batch completed successfully!")
 
 def on_next_image(b):
     if state['current_idx'] < len(state['files']) - 1:
         state['current_idx'] += 1
         load_image_at_index(state['current_idx'])
     else:
-        with log_output:
-            clear_output()
-            print("🎉 Completed all remaining files in the queue!")
+        with log_output: clear_output(); print("🎉 Completed all files in the queue!")
 
 # Wire events
 mask_source_dropdown.observe(on_mask_source_change, names='value')
@@ -1251,6 +1346,9 @@ fig.canvas.mpl_connect('key_press_event', on_key_press)
 fig.canvas.mpl_connect('scroll_event', on_scroll)
 
 load_folder_btn.on_click(on_load_folder)
+load_analyzed_btn.on_click(on_load_analyzed_folder)
+batch_unattended_btn.on_click(on_batch_unattended)
+
 clear_paint_btn.on_click(on_clear_paint)
 save_barrier_btn.on_click(on_save_barrier)
 auto_seed_btn.on_click(auto_generate_seeds)
@@ -1277,7 +1375,8 @@ next_image_btn.on_click(on_next_image)
 # ==========================================
 col1 = widgets.VBox([
     input_folder_input, 
-    widgets.HBox([load_folder_btn, file_info_label]),
+    widgets.HBox([load_folder_btn, load_analyzed_btn, batch_unattended_btn]),
+    file_info_label,
     target_list_ui,
     widgets.HBox([status_dropdown, apply_status_btn]),
     delete_target_btn,

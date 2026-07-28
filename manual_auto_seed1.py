@@ -7,7 +7,7 @@ from matplotlib.colors import ListedColormap
 from tifffile import imread, imwrite
 from skimage.filters import gaussian
 from skimage.draw import disk
-from scipy.ndimage import distance_transform_edt, label, binary_fill_holes, uniform_filter, maximum_position, binary_erosion
+from scipy.ndimage import distance_transform_edt, label, binary_fill_holes, uniform_filter, maximum_position, binary_erosion, gaussian_filter, binary_dilation
 import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML
 
@@ -83,7 +83,7 @@ pink_cmap = ListedColormap(['#ff69b4'])
 green_cmap = ListedColormap(['#00ff00'])
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 5.5))
-plt.subplots_adjust(bottom=0.05, top=0.92, left=0.02, right=0.98, wspace=0.05)
+plt.subplots_adjust(bottom=0.05, top=0.88, left=0.02, right=0.98, wspace=0.05)
 fig.suptitle("IntSpine: Interactive Spine Analysis", fontsize=14, fontweight='bold')
 
 dummy_img = np.zeros((10, 10))
@@ -125,8 +125,11 @@ wl_slider = widgets.IntRangeSlider(value=[0, 1], min=0, max=1, description='Win/
 barrier_slider = widgets.FloatSlider(value=1.2, min=0.0, max=4.0, step=0.1, description='Barrier µm:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
 tol_slider = widgets.FloatSlider(value=0.45, min=0.05, max=0.90, step=0.05, description='Tolerance:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
 z_search_slider = widgets.IntSlider(value=10, min=0, max=20, step=1, description='Z-Search:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
-
 max_geodesic_slider = widgets.FloatSlider(value=5.0, min=1.0, max=15.0, step=0.5, description='Max Geodesic µm:', style={'description_width': '105px'}, layout=widgets.Layout(width='360px'))
+
+use_hessian_cb = widgets.Checkbox(value=True, description='Use 2D Curvature Isolation', indent=False, layout=widgets.Layout(width='230px'))
+strictness_slider = widgets.FloatSlider(value=0.00, min=-0.05, max=0.05, step=0.005, description='Blob Strictness:', style={'description_width': '100px'}, layout=widgets.Layout(width='360px'))
+hessian_sigma_slider = widgets.FloatSlider(value=1.5, min=0.5, max=4.0, step=0.1, description='Hessian \u03c3:', style={'description_width': '100px'}, layout=widgets.Layout(width='360px'))
 
 show_targets_cb = widgets.Checkbox(value=True, description='Show Markers', indent=False, layout=widgets.Layout(width='140px'))
 show_mask_cb = widgets.Checkbox(value=True, description='Show Segment', indent=False, layout=widgets.Layout(width='140px'))
@@ -134,15 +137,12 @@ show_mask_cb = widgets.Checkbox(value=True, description='Show Segment', indent=F
 target_list_ui = widgets.SelectMultiple(options=[], description='Target List:', style={'description_width': 'initial'}, layout={'width': '365px', 'height': '150px'})
 delete_target_btn = widgets.Button(description='Delete Selected Targets', button_style='danger', icon='trash', layout=widgets.Layout(width='365px'))
 
-# Status Application UI
 status_dropdown = widgets.Dropdown(options=['static', 'new', 'eliminated'], value='static', description='Status:', layout=widgets.Layout(width='180px'))
 apply_status_btn = widgets.Button(description='Apply Status', button_style='info', icon='check', layout=widgets.Layout(width='180px'))
 
-# Rename UI
 rename_id_input = widgets.Text(placeholder='New ID', layout=widgets.Layout(width='180px'))
 rename_id_btn = widgets.Button(description='Update Target ID', button_style='warning', icon='edit', layout=widgets.Layout(width='180px'))
 
-# Control Buttons
 auto_seed_btn = widgets.Button(description='Auto-Seed', button_style='warning', icon='magic', layout=widgets.Layout(width='115px'))
 respan_seed2_btn = widgets.Button(description='CSV Seed 2', button_style='info', icon='file-text', layout=widgets.Layout(width='115px'))
 respan_seed3_btn = widgets.Button(description='CSV Seed 3', button_style='info', icon='file-text', layout=widgets.Layout(width='115px'))
@@ -174,6 +174,28 @@ def get_effective_barrier():
     
     effective = (base | painted_3d) & (~erased_3d)
     return effective
+
+def get_2d_hessian_blob_mask(V_sub, strictness, sig=1.5):
+    """Applies a 2D Hessian filter slice-by-slice to avoid Z-axis anisotropy distortion."""
+    mask = np.zeros_like(V_sub, dtype=bool)
+    for zi in range(V_sub.shape[0]):
+        slice_v = V_sub[zi].astype(float)
+        if slice_v.max() > 0:
+            slice_v = slice_v / slice_v.max()
+        else:
+            continue
+            
+        Dyy = gaussian_filter(slice_v, sigma=sig, order=[2, 0])
+        Dxx = gaussian_filter(slice_v, sigma=sig, order=[0, 2])
+        Dxy = gaussian_filter(slice_v, sigma=sig, order=[1, 1])
+        
+        H2 = np.zeros((2, 2) + slice_v.shape)
+        H2[0,0]=Dyy; H2[0,1]=Dxy; H2[1,0]=Dxy; H2[1,1]=Dxx
+        H2 = np.moveaxis(H2, [0,1], [-2,-1])
+        
+        l1 = np.linalg.eigvalsh(H2)[..., 1]
+        mask[zi] = l1 <= strictness
+    return mask
 
 def apply_mask_source():
     if state['raw_stack'] is None: return
@@ -242,9 +264,9 @@ def on_mask_source_change(change):
         apply_mask_source()
         refresh_display()
 
-def find_optimal_xyz(x, y, search_radius=5):
+def find_optimal_xyz(x, y, search_radius=5, start_z=None):
     if state['base_smoothed_stack'] is None: 
-        return state['z'], y, x
+        return state['z'] if start_z is None else start_z, y, x
         
     stack = state['base_smoothed_stack']
     
@@ -253,21 +275,35 @@ def find_optimal_xyz(x, y, search_radius=5):
     x_min = max(0, x - search_radius)
     x_max = min(stack.shape[2], x + search_radius + 1)
     
-    sub_volume = stack[:, y_min:y_max, x_min:x_max].copy().astype(np.float64)
+    if start_z is None:
+        z_profile = stack[:, y, x]
+        eff_barrier_1d = get_effective_barrier()[:, y, x]
+        masked_profile = np.where(eff_barrier_1d, -1e9, z_profile)
+        if np.all(masked_profile == -1e9):
+            best_z = int(np.argmax(z_profile))
+        else:
+            best_z = int(np.argmax(masked_profile))
+    else:
+        best_z = start_z
+        
+    z_min = max(0, best_z - 1)
+    z_max = min(stack.shape[0], best_z + 2)
+    
+    sub_volume = stack[z_min:z_max, y_min:y_max, x_min:x_max].copy().astype(np.float64)
     sub_volume = uniform_filter(sub_volume, size=3)
     
     eff_barrier_3d = get_effective_barrier()
-    eff_bar_sub = eff_barrier_3d[:, y_min:y_max, x_min:x_max]
+    eff_bar_sub = eff_barrier_3d[z_min:z_max, y_min:y_max, x_min:x_max]
     
     sub_volume[eff_bar_sub] = -1e9
             
     if np.all(sub_volume == -1e9):
-        return state['z'], y, x 
+        return best_z, y, x 
     
     max_idx = np.argmax(sub_volume)
     z_loc, dy_loc, dx_loc = np.unravel_index(max_idx, sub_volume.shape)
     
-    opt_z = int(z_loc)
+    opt_z = int(z_min + z_loc)
     opt_y = int(y_min + dy_loc)
     opt_x = int(x_min + dx_loc)
     
@@ -325,7 +361,7 @@ def auto_generate_seeds(b=None):
                 filtered_count += 1
                 continue
             
-            opt_z, opt_y, opt_x = find_optimal_xyz(x_loc, y_loc, search_radius=5)
+            opt_z, opt_y, opt_x = find_optimal_xyz(x_loc, y_loc, search_radius=5, start_z=None)
             
             idx = state['target_counter']
             status = 'static'
@@ -374,7 +410,6 @@ def load_csv_seeds(seed_type):
         
         try:
             df = pd.read_csv(csv_file)
-            # Find appropriate X and Y columns
             x_col = next((c for c in df.columns if c.lower() in ['x', 'corrected_x', 'centroid_x']), None)
             y_col = next((c for c in df.columns if c.lower() in ['y', 'corrected_y', 'centroid_y']), None)
             
@@ -398,11 +433,10 @@ def load_csv_seeds(seed_type):
                 x_loc = int(round(row[x_col]))
                 y_loc = int(round(row[y_col]))
                 
-                # Check image bounds
                 if not (0 <= y_loc < state['raw_stack'].shape[1] and 0 <= x_loc < state['raw_stack'].shape[2]):
                     continue
                     
-                opt_z, opt_y, opt_x = find_optimal_xyz(x_loc, y_loc, search_radius=5)
+                opt_z, opt_y, opt_x = find_optimal_xyz(x_loc, y_loc, search_radius=5, start_z=None)
                 
                 idx = state['target_counter']
                 status = 'static'
@@ -620,7 +654,7 @@ def on_mouse_press(event):
             state['click_x'] = clicked_x
             state['click_y'] = clicked_y
             
-            opt_z, opt_y, opt_x = find_optimal_xyz(clicked_x, clicked_y, search_radius=5)
+            opt_z, opt_y, opt_x = find_optimal_xyz(clicked_x, clicked_y, search_radius=5, start_z=state['z'])
             
             state['target_z'] = opt_z
             state['target_y'] = opt_y
@@ -911,7 +945,7 @@ def on_analyze_all(b):
     current_zsearch_val = z_search_slider.value
     
     with log_output:
-        print(f"⚙️ Batch processing targets...")
+        print(f"⚙️ Batch processing targets using 2.5D Dilated Envelope Extrusion...")
         
         for target in state['saved_targets']:
             z, y, x, idx = target['z'], target['y'], target['x'], target['idx']
@@ -953,6 +987,17 @@ def on_analyze_all(b):
                 })
                 continue
                 
+            pad_xy = 30
+            pad_z = current_zsearch_val
+            z_min_loc = max(0, z - pad_z)
+            z_max_loc = min(state['raw_stack'].shape[0], z + pad_z + 1)
+            y_min_loc = max(0, y - pad_xy)
+            y_max_loc = min(state['raw_stack'].shape[1], y + pad_xy + 1)
+            x_min_loc = max(0, x - pad_xy)
+            x_max_loc = min(state['raw_stack'].shape[2], x + pad_xy + 1)
+            
+            lz, ly, lx = z - z_min_loc, y - y_min_loc, x - x_min_loc
+
             if state['erased_barrier_2d'] is not None and state['erased_barrier_2d'][y, x]:
                 seed_val = state['base_smoothed_stack'][z, y, x]
             else:
@@ -962,49 +1007,76 @@ def on_analyze_all(b):
                 print(f"❌ Target [{idx}] skipped: Seed is inside the pink dendritic barrier.")
                 continue
                 
+            sub_stack = current_smoothed_stack[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
             lower_bound = max(seed_val * (1.0 - current_tolerance_val), 1e-6)
-            binary_thresh = current_smoothed_stack >= lower_bound
             
-            z_min = max(0, z - current_zsearch_val)
-            z_max = min(current_smoothed_stack.shape[0], z + current_zsearch_val + 1)
-            binary_thresh[:z_min, :, :] = False
-            binary_thresh[z_max:, :, :] = False
+            # --- 1. 2D OPTIMAL SLICE SEGMENTATION ---
+            slice_2d = sub_stack[lz]
+            binary_2d = slice_2d >= lower_bound
             
-            labeled_mask, _ = label(binary_thresh)
-            seed_label = labeled_mask[z, y, x]
+            if use_hessian_cb.value:
+                # Apply 2D curvature check to just this highly focused slice
+                V_slice = np.expand_dims(slice_2d, 0)
+                blob_mask_2d = get_2d_hessian_blob_mask(V_slice, strictness_slider.value, sig=hessian_sigma_slider.value)[0]
+                blob_mask_2d[ly, lx] = True # Protect anchor
+                binary_2d = binary_2d & blob_mask_2d
+                
+            labeled_2d, _ = label(binary_2d)
+            seed_label_2d = labeled_2d[ly, lx]
             
-            if seed_label == 0:
-                print(f"❌ Target [{idx}] skipped: Threshold too strict or point invalid.")
+            if seed_label_2d == 0:
+                print(f"❌ Target [{idx}] skipped: 2D seed slice failed threshold or topology.")
                 continue
                 
-            spine_mask = (labeled_mask == seed_label)
-            spine_mask = binary_fill_holes(spine_mask)
+            spine_mask_2d = (labeled_2d == seed_label_2d)
+            spine_mask_2d = binary_fill_holes(spine_mask_2d)
+            
+            # --- 2. THE DILATED ENVELOPE (2.5D Extrusion) ---
+            # Dilate the 2D mask by 3 pixels to allow for spine tilt/width variation
+            dilated_2d = binary_dilation(spine_mask_2d, iterations=3)
+            # Extrude into a vertical bounding column
+            envelope_3d = np.broadcast_to(dilated_2d, sub_stack.shape)
+            
+            # --- 3. BOUNDED 3D SEGMENTATION ---
+            local_binary = sub_stack >= lower_bound
+            
+            if use_hessian_cb.value:
+                blob_mask_3d = get_2d_hessian_blob_mask(sub_stack, strictness_slider.value, sig=hessian_sigma_slider.value)
+                blob_mask_3d[lz, ly, lx] = True 
+                local_binary = local_binary & blob_mask_3d
+                
+            # Physically bound the 3D growth inside the extruded envelope to kill longitudinal bleeding
+            local_binary = local_binary & envelope_3d
+            
+            labeled_local, _ = label(local_binary)
+            seed_label = labeled_local[lz, ly, lx]
+            
+            if seed_label == 0:
+                print(f"❌ Target [{idx}] skipped: 3D region growing failed inside envelope.")
+                continue
+                
+            local_spine_mask = (labeled_local == seed_label)
+            local_spine_mask = binary_fill_holes(local_spine_mask)
+            
+            global_target_mask = np.zeros_like(combined_mask)
+            global_target_mask[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc] = local_spine_mask
             
             classification_label = 'Spine'
             
             if t_type == 'spine':
-                combined_mask = np.logical_or(combined_mask, spine_mask)
+                combined_mask = np.logical_or(combined_mask, global_target_mask)
             elif t_type == 'suboptimal':
                 classification_label = 'Suboptimal Measures'
             
-            voxels = np.sum(spine_mask)
+            voxels = np.sum(global_target_mask)
             vol = voxels * voxel_volume
-            max_intensity = int(state['raw_stack'][spine_mask].max())
-            sum_intensity = np.sum(state['raw_stack'][spine_mask], dtype=np.float64)
+            max_intensity = int(state['raw_stack'][global_target_mask].max())
+            sum_intensity = np.sum(state['raw_stack'][global_target_mask], dtype=np.float64)
             int_density = sum_intensity
-            z_slices_count = int(np.sum(np.any(spine_mask, axis=(1, 2))))
+            z_slices_count = int(np.sum(np.any(global_target_mask, axis=(1, 2))))
             
-            area_opt_z_voxels = np.sum(spine_mask[z, :, :])
+            area_opt_z_voxels = np.sum(global_target_mask[z, :, :])
             area_opt_z_um2 = area_opt_z_voxels * (dx * dy)
-            
-            pad_xy = 25
-            pad_z = current_zsearch_val
-            z_min_loc = max(0, z - pad_z)
-            z_max_loc = min(state['raw_stack'].shape[0], z + pad_z + 1)
-            y_min_loc = max(0, y - pad_xy)
-            y_max_loc = min(state['raw_stack'].shape[1], y + pad_xy + 1)
-            x_min_loc = max(0, x - pad_xy)
-            x_max_loc = min(state['raw_stack'].shape[2], x + pad_xy + 1)
 
             local_barrier = total_barrier[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
             local_raw = state['raw_stack'][z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
@@ -1226,6 +1298,7 @@ col3 = widgets.VBox([
     mask_source_dropdown,
     widgets.HBox([mode_radio, widgets.VBox([brush_size_slider, widgets.HBox([clear_paint_btn, save_barrier_btn])])]),
     z_slider, wl_slider, barrier_slider, tol_slider, z_search_slider, max_geodesic_slider,
+    use_hessian_cb, strictness_slider, hessian_sigma_slider,
     widgets.HBox([show_targets_cb, show_mask_cb])
 ], layout=widgets.Layout(width='390px', padding='0px 0px 0px 10px'))
 

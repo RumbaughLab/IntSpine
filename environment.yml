@@ -3,13 +3,11 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.10
+  - python=3.13
   - numpy
   - pandas
   - matplotlib
   - scipy
   - scikit-image
   - tifffile
-  - pip
-  - pip:
-    - PySide6
+  - pyside6

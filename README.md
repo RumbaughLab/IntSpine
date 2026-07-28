@@ -1,7 +1,7 @@
 
-<img src="intspine_logo.png" width="60" title="IntSpine" alt="IntSpine" align="left" vspace = "5">
+<img src="intspine_logo.png" width="60" title="IntSpine" alt="IntSpine" align="left" vspace = "50">
 
-#   IntSpine: <br>   Interactive Spine Analysis Tool
+#   IntSpine: Interactive Spine Analysis Tool
  
 
 ## Overview

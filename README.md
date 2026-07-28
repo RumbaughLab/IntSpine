@@ -1,4 +1,8 @@
-# IntSpine: Volumetric Interactive Spine Analysis Tool
+
+<img src="intspine_logo.png" width="60" title="IntSpine" alt="IntSpine" align="left" vspace = "5">
+
+#   IntSpine: <br>   Interactive Spine Analysis Tool
+ 
 
 ## Overview
 This repository contains a standalone Python desktop application (PySide6) and associated tools for volumetric spine quantification from z-stack images. It was developed to benchmark automated solutions against ground truth data, as existing tools were not optimal for high-resolution datasets. 

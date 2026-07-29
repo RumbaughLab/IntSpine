@@ -7,15 +7,18 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from tifffile import imread, imwrite
-from skimage.filters import gaussian
+from scipy.ndimage import distance_transform_edt, label, binary_fill_holes, uniform_filter, maximum_position, binary_erosion, gaussian_filter, binary_dilation, convolve
+from scipy.spatial.distance import pdist, squareform
 from skimage.draw import disk
-from scipy.ndimage import distance_transform_edt, label, binary_fill_holes, uniform_filter, maximum_position, binary_erosion, gaussian_filter, binary_dilation
+from skimage import measure, morphology, filters, graph
+from skimage.filters import gaussian  
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QLineEdit, QComboBox, QSlider, QCheckBox, 
                                QListWidget, QAbstractItemView, QTextEdit, QFileDialog, QRadioButton, QButtonGroup, QGroupBox)
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence, QIcon
 from PySide6.QtCore import Qt
+import ctypes
 
 # ==========================================
 # 1. CORE APPLICATION CLASS
@@ -25,6 +28,10 @@ class SpineAnalyzerApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("IntSpine: Volumetric Interactive Spine Analyzer")
         self.resize(1600, 900)
+        
+        icon_path = os.path.join(os.path.dirname(__file__), 'intspine_logo.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         
         # State Variables
         self.dz, self.dy, self.dx = 0.3, 0.108, 0.108  
@@ -44,7 +51,7 @@ class SpineAnalyzerApp(QMainWindow):
         self.z = 0
         self.click_x = None; self.click_y = None       
         self.target_x = None; self.target_y = None; self.target_z = None 
-        self.mask = None # Now uint16 Instance Mask
+        self.mask = None 
         self.shaft_barrier = None
         
         self.painted_barrier_2d = None
@@ -74,7 +81,6 @@ class SpineAnalyzerApp(QMainWindow):
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(5, 5, 5, 5)
         
-        # Folder Selection
         folder_group = QGroupBox("Data Input")
         folder_layout = QVBoxLayout()
         
@@ -99,14 +105,12 @@ class SpineAnalyzerApp(QMainWindow):
         folder_group.setLayout(folder_layout)
         left_layout.addWidget(folder_group)
         
-        # Target List
-        target_group = QGroupBox("Target Queue")
+        target_group = QGroupBox("Target List")
         target_layout = QVBoxLayout()
         self.list_targets = QListWidget()
         self.list_targets.setSelectionMode(QAbstractItemView.ExtendedSelection)
         target_layout.addWidget(self.list_targets)
         
-        # Target Actions
         status_layout = QHBoxLayout()
         self.combo_status = QComboBox()
         self.combo_status.addItems(['static', 'new', 'eliminated'])
@@ -128,7 +132,6 @@ class SpineAnalyzerApp(QMainWindow):
         target_group.setLayout(target_layout)
         left_layout.addWidget(target_group)
         
-        # Seeding & Analysis
         action_group = QGroupBox("Actions")
         action_layout = QVBoxLayout()
         
@@ -164,10 +167,16 @@ class SpineAnalyzerApp(QMainWindow):
         
         self.btn_analyze = QPushButton("Analyze & Save Targets")
         self.btn_analyze.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold;")
+        action_layout.addWidget(self.btn_analyze)
+        
+        nav_img_layout = QHBoxLayout()
+        self.btn_prev = QPushButton("< Prev Image")
+        self.btn_prev.setStyleSheet("background-color: #1565C0; color: white; font-weight: bold;")
         self.btn_next = QPushButton("Next Image >")
         self.btn_next.setStyleSheet("background-color: #1565C0; color: white; font-weight: bold;")
-        action_layout.addWidget(self.btn_analyze)
-        action_layout.addWidget(self.btn_next)
+        nav_img_layout.addWidget(self.btn_prev)
+        nav_img_layout.addWidget(self.btn_next)
+        action_layout.addLayout(nav_img_layout)
         
         self.input_custom_id = QLineEdit()
         self.input_custom_id.setPlaceholderText("Override Start ID...")
@@ -180,12 +189,11 @@ class SpineAnalyzerApp(QMainWindow):
         # --- CENTER COLUMN (Matplotlib Canvas) ---
         center_layout = QVBoxLayout()
         plt.style.use('dark_background')
-        
-        # Synchronized axes via sharex and sharey
         self.fig, (self.ax1, self.ax2) = plt.subplots(1, 2, figsize=(8.5, 5.5), sharex=True, sharey=True)
         self.fig.subplots_adjust(bottom=0.05, top=0.92, left=0.02, right=0.98, wspace=0.05)
         
         self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas.setFocusPolicy(Qt.StrongFocus) 
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         self.toolbar.hide()
         
@@ -226,11 +234,18 @@ class SpineAnalyzerApp(QMainWindow):
         settings_group = QGroupBox("Processing Settings")
         set_lyt = QVBoxLayout()
         
+        set_lyt.addWidget(QLabel("Mask Source:"))
+        
+        mask_h_lyt = QHBoxLayout()
         self.combo_mask_source = QComboBox()
         self.combo_mask_source.addItems(['SWC Mask', 'Geo Mask', 'Respan Mask'])
-        self.combo_mask_source.setCurrentText('Geo Mask') # Default correctly set
-        set_lyt.addWidget(QLabel("Mask Source:"))
-        set_lyt.addWidget(self.combo_mask_source)
+        self.combo_mask_source.setCurrentText('Geo Mask')
+        mask_h_lyt.addWidget(self.combo_mask_source)
+        
+        self.btn_auto_barrier = QPushButton("Auto-Gen Barrier")
+        self.btn_auto_barrier.setStyleSheet("background-color: #6A1B9A; color: white;")
+        mask_h_lyt.addWidget(self.btn_auto_barrier)
+        set_lyt.addLayout(mask_h_lyt)
         
         mode_lyt = QHBoxLayout()
         self.bg_mode = QButtonGroup()
@@ -285,10 +300,13 @@ class SpineAnalyzerApp(QMainWindow):
         
         disp_group = QGroupBox("Display")
         disp_lyt = QHBoxLayout()
+        self.chk_barrier = QCheckBox("Show Barrier")
         self.chk_markers = QCheckBox("Show Markers")
         self.chk_segment = QCheckBox("Show Segment")
+        self.chk_barrier.setChecked(True)
         self.chk_markers.setChecked(True)
         self.chk_segment.setChecked(True)
+        disp_lyt.addWidget(self.chk_barrier)
         disp_lyt.addWidget(self.chk_markers)
         disp_lyt.addWidget(self.chk_segment)
         disp_group.setLayout(disp_lyt)
@@ -336,13 +354,12 @@ class SpineAnalyzerApp(QMainWindow):
         if clear: self.log_output.clear()
         self.log_output.append(msg)
         self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
-        QApplication.processEvents() # Keeps UI responsive
+        QApplication.processEvents() 
 
     # ==========================================
     # 3. LOGIC & EVENT CONNECTIONS
     # ==========================================
     def connect_signals(self):
-        # Native Qt Global Keyboard Shortcuts (Bulletproof focus)
         QShortcut(QKeySequence("z"), self).activated.connect(lambda: self.on_save_target('spine'))
         QShortcut(QKeySequence("x"), self).activated.connect(lambda: self.on_save_target('filopodia'))
         QShortcut(QKeySequence("c"), self).activated.connect(lambda: self.on_save_target('suboptimal'))
@@ -353,13 +370,14 @@ class SpineAnalyzerApp(QMainWindow):
         QShortcut(QKeySequence("f"), self).activated.connect(self.toolbar.zoom)
         QShortcut(QKeySequence("d"), self).activated.connect(self.toolbar.pan)
 
-        # Standard Widget Connectors
         self.btn_browse.clicked.connect(self.browse_folder)
         self.btn_load.clicked.connect(self.on_load_folder)
         self.btn_load_analyzed.clicked.connect(self.on_load_analyzed_folder)
         self.btn_batch.clicked.connect(self.on_batch_unattended)
         
         self.combo_mask_source.currentTextChanged.connect(self.on_mask_source_change)
+        self.btn_auto_barrier.clicked.connect(self.on_auto_generate_barrier) 
+        
         self.rb_target.toggled.connect(self.refresh_display)
         self.btn_clear_paint.clicked.connect(self.on_clear_paint)
         self.btn_save_barrier.clicked.connect(self.on_save_barrier)
@@ -369,6 +387,7 @@ class SpineAnalyzerApp(QMainWindow):
         self.lbl_wl_max.valueChanged.connect(self.update_contrast)
         self.lbl_barrier.valueChanged.connect(self.on_barrier_change)
         
+        self.chk_barrier.toggled.connect(self.refresh_display)
         self.chk_markers.toggled.connect(self.refresh_display)
         self.chk_segment.toggled.connect(self.refresh_display)
         
@@ -391,6 +410,7 @@ class SpineAnalyzerApp(QMainWindow):
         self.btn_pan.clicked.connect(self.toolbar.pan)
         
         self.btn_analyze.clicked.connect(lambda: self.on_analyze_all())
+        self.btn_prev.clicked.connect(self.on_prev_image)
         self.btn_next.clicked.connect(self.on_next_image)
         
         self.fig.canvas.mpl_connect('button_press_event', self.on_mouse_press)
@@ -464,6 +484,74 @@ class SpineAnalyzerApp(QMainWindow):
                 total_length += dist
         return dist_3d, total_length
 
+    # --- AUTO BARRIER GENERATOR ---
+    def on_auto_generate_barrier(self):
+        if self.raw_stack is None:
+            self.log("⚠️ No image loaded to generate barrier.", clear=True)
+            return
+            
+        self.log("⚙️ Auto-generating dendritic barrier using geodesic reconstruction...", clear=True)
+        QApplication.processEvents()
+
+        mip = np.max(self.raw_stack, axis=0) if self.raw_stack.ndim == 3 else self.raw_stack
+        smoothed = gaussian(mip.astype(float), sigma=1.0)
+        
+        try:
+            thresh = filters.threshold_otsu(smoothed)
+        except Exception as e:
+            self.log(f"❌ Thresholding failed: {e}")
+            return
+            
+        binary_mask = smoothed > thresh
+        labeled = measure.label(binary_mask)
+        if labeled.max() == 0:
+            self.log("❌ Failed to isolate a dendrite. Try manual masking.")
+            return
+            
+        largest_cc = (labeled == np.argmax(np.bincount(labeled.flat)[1:]) + 1)
+        edt_2d = distance_transform_edt(largest_cc)
+        skel = morphology.skeletonize(largest_cc)
+        
+        kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 1, 1]])
+        neighbor_count = convolve(skel.astype(int), kernel, mode='constant')
+        endpoints = np.argwhere((neighbor_count == 11) & skel)
+        
+        if len(endpoints) < 2:
+            self.log("❌ Could not find reliable skeleton endpoints.")
+            return
+            
+        D = squareform(pdist(endpoints))
+        i, j = np.unravel_index(np.argmax(D), D.shape)
+        start_pt, end_pt = tuple(endpoints[i]), tuple(endpoints[j])
+        
+        cost_map = np.where(skel, 1, 1e6)
+        path, _ = graph.route_through_array(cost_map, start=start_pt, end=end_pt, fully_connected=True)
+        
+        reconstructed_shaft = np.zeros_like(largest_cc)
+        for r, c in path:
+            radius = edt_2d[r, c]
+            if radius > 0:
+                rr, cc = disk((r, c), radius + 0.5, shape=reconstructed_shaft.shape)
+                reconstructed_shaft[rr, cc] = True
+                
+        dir_name = os.path.dirname(self.files[self.current_idx])
+        base_name = os.path.splitext(os.path.basename(self.files[self.current_idx]))[0]
+        if base_name.endswith('.tif'): base_name = os.path.splitext(base_name)[0]
+        
+        geo_path = os.path.join(dir_name, base_name + '_dendrite-geo.tif')
+        imwrite(geo_path, (reconstructed_shaft.astype(np.uint8) * 255))
+        
+        self.dendrite_length_um = len(path) * self.dy  
+        self.log(f"✅ Auto-Barrier generated & saved to {os.path.basename(geo_path)}! Length: ~{self.dendrite_length_um:.2f} µm.")
+        
+        self.combo_mask_source.blockSignals(True)
+        self.combo_mask_source.setCurrentText('Geo Mask')
+        self.combo_mask_source.blockSignals(False)
+        self.lbl_barrier.setValue(0)
+        
+        self.apply_mask_source()
+        self.refresh_display()
+
     def apply_mask_source(self):
         if self.raw_stack is None: return
         filepath = self.files[self.current_idx]
@@ -483,20 +571,26 @@ class SpineAnalyzerApp(QMainWindow):
             else:
                 self.log("⚠️ No SWC file found. Default barrier disabled.")
         else:
-            pattern = "*geo*.tif" if val == 'Geo Mask' else "*respan*.tif"
-            matches = glob(os.path.join(dir_name, f"{base_name}{pattern}")) or glob(os.path.join(dir_name, f"*{pattern}"))
+            # STRICT GLOB: Only matches files that explicitly start with the image's base_name
+            pattern = "*geo*.tif*" if val == 'Geo Mask' else "*respan*.tif*"
+            matches = glob(os.path.join(dir_name, f"{base_name}{pattern}"))
+            
             if matches:
                 mask_file = matches[0]
                 self.log(f"✅ Found {val} file: {os.path.basename(mask_file)}")
                 loaded_mask = imread(mask_file) > 0
-                if loaded_mask.ndim == 2:
-                    dist_2d = distance_transform_edt(~loaded_mask, sampling=[self.dy, self.dx])
-                    dist_3d = np.broadcast_to(dist_2d, self.raw_stack.shape).copy()
-                elif loaded_mask.ndim == 3:
-                    dist_3d = distance_transform_edt(~loaded_mask, sampling=[self.dz, self.dy, self.dx])
-                self.log("💡 Tip: Set 'Barrier µm' slider to 0.0 if you want exact pre-calculated mask.")
+                
+                # STRICT SHAPE CHECK: Protects against ValueErrors when masks and raw images are cropped differently
+                if loaded_mask.shape[-2:] != self.raw_stack.shape[-2:]:
+                    self.log(f"⚠️ Mask shape {loaded_mask.shape} mismatches image {self.raw_stack.shape}. Ignoring mask.")
+                else:
+                    if loaded_mask.ndim == 2:
+                        dist_2d = distance_transform_edt(~loaded_mask, sampling=[self.dy, self.dx])
+                        dist_3d = np.broadcast_to(dist_2d, self.raw_stack.shape).copy()
+                    elif loaded_mask.ndim == 3:
+                        dist_3d = distance_transform_edt(~loaded_mask, sampling=[self.dz, self.dy, self.dx])
             else:
-                self.log(f"⚠️ No {val} file found matching '{pattern}'. Barrier disabled.")
+                self.log(f"⚠️ No {val} file found matching '{base_name}{pattern}'.")
                 
         self.dist_field_3d = dist_3d
         self.dendrite_length_um = d_len
@@ -557,13 +651,17 @@ class SpineAnalyzerApp(QMainWindow):
         self.base_smoothed_stack = gaussian(self.raw_stack, sigma=1.0, preserve_range=True).astype(self.raw_stack.dtype)
         
         h, w = self.raw_stack.shape[1], self.raw_stack.shape[2]
-        
-        # Reset the limits completely to un-stick old shared axis scaling locks
         self.ax1.set_xlim(-0.5, w - 0.5); self.ax1.set_ylim(h - 0.5, -0.5)
         
         extent = [-0.5, w - 0.5, h - 0.5, -0.5]
         for disp in [self.img_display, self.barrier_display, self.mask_display, self.mip_display, self.mip_barrier_display, self.mip_mask_display]:
             disp.set_extent(extent)
+            
+        # FORCE BUFFER FLUSH: Instantly clear visuals with invisible zeros
+        empty = np.zeros((h, w))
+        for disp in [self.barrier_display, self.mip_barrier_display, self.mask_display, self.mip_mask_display]:
+            disp.set_data(empty)
+            disp.set_alpha(0.0)
         
         self.apply_mask_source()
 
@@ -587,7 +685,6 @@ class SpineAnalyzerApp(QMainWindow):
         self.loaded_df = None
         self.input_custom_id.setText('')
         
-        # --- Correction Mode Loading ---
         if self.is_correction_mode:
             csv_path_corr = os.path.join(out_dir, base_name + '_corrected_spine_results.csv')
             csv_path_orig = os.path.join(out_dir, base_name + '_spine_results.csv')
@@ -657,22 +754,56 @@ class SpineAnalyzerApp(QMainWindow):
         self.img_display.set_data(self.raw_stack[z])
         self.update_contrast()
         
-        eff_barrier = self.get_effective_barrier()
-        barrier_z = eff_barrier[z]
-        barrier_mip = np.max(eff_barrier, axis=0)
+        # --- BARRIER OVERLAY UPDATE (Ghosting Fix) ---
+        if self.chk_barrier.isChecked():
+            eff_barrier = self.get_effective_barrier()
+            barrier_z = eff_barrier[z]
+            barrier_mip = np.max(eff_barrier, axis=0)
+            
+            if np.any(barrier_z):
+                self.barrier_display.set_data(np.ma.masked_where(~barrier_z, barrier_z))
+                self.barrier_display.set_alpha(0.3)
+            else:
+                self.barrier_display.set_data(np.zeros_like(barrier_z))
+                self.barrier_display.set_alpha(0.0)
+                
+            if np.any(barrier_mip):
+                self.mip_barrier_display.set_data(np.ma.masked_where(~barrier_mip, barrier_mip))
+                self.mip_barrier_display.set_alpha(0.2)
+            else:
+                self.mip_barrier_display.set_data(np.zeros_like(barrier_mip))
+                self.mip_barrier_display.set_alpha(0.0)
+        else:
+            self.barrier_display.set_data(np.zeros_like(self.raw_stack[z]))
+            self.barrier_display.set_alpha(0.0)
+            self.mip_barrier_display.set_data(np.zeros_like(self.raw_stack[0]))
+            self.mip_barrier_display.set_alpha(0.0)
         
-        self.barrier_display.set_data(np.ma.masked_where(~barrier_z, barrier_z))
-        self.mip_barrier_display.set_data(np.ma.masked_where(~barrier_mip, barrier_mip))
-        
+        # --- MASK/SEGMENT OVERLAY UPDATE (Ghosting Fix) ---
         if self.chk_segment.isChecked():
             z_mask = self.mask[z] > 0
-            self.mask_display.set_data(np.ma.masked_where(~z_mask, z_mask))
             mip_m = np.max(self.mask, axis=0) > 0
-            self.mip_mask_display.set_data(np.ma.masked_where(~mip_m, mip_m))
+            
+            if np.any(z_mask):
+                self.mask_display.set_data(np.ma.masked_where(~z_mask, z_mask))
+                self.mask_display.set_alpha(0.6)
+            else:
+                self.mask_display.set_data(np.zeros_like(z_mask))
+                self.mask_display.set_alpha(0.0)
+                
+            if np.any(mip_m):
+                self.mip_mask_display.set_data(np.ma.masked_where(~mip_m, mip_m))
+                self.mip_mask_display.set_alpha(0.6)
+            else:
+                self.mip_mask_display.set_data(np.zeros_like(mip_m))
+                self.mip_mask_display.set_alpha(0.0)
         else:
-            self.mask_display.set_data(np.ma.masked_all(self.raw_stack[z].shape))
-            self.mip_mask_display.set_data(np.ma.masked_all(barrier_mip.shape))
+            self.mask_display.set_data(np.zeros_like(self.raw_stack[z]))
+            self.mask_display.set_alpha(0.0)
+            self.mip_mask_display.set_data(np.zeros_like(self.raw_stack[0]))
+            self.mip_mask_display.set_alpha(0.0)
         
+        # --- CLEAR & REDRAW MARKERS ---
         for item in self.texts_ax1 + self.texts_ax2 + self.dots_ax1 + self.dots_ax2:
             try: item.remove()
             except: pass
@@ -721,10 +852,13 @@ class SpineAnalyzerApp(QMainWindow):
         elif self.rb_erase.isChecked():
             self.erased_barrier_2d[rr, cc] = True; self.painted_barrier_2d[rr, cc] = False
         
-        eff_barrier = self.get_effective_barrier()
-        self.barrier_display.set_data(np.ma.masked_where(~eff_barrier[self.z], eff_barrier[self.z]))
-        self.mip_barrier_display.set_data(np.ma.masked_where(~np.max(eff_barrier, axis=0), np.max(eff_barrier, axis=0)))
-        self.fig.canvas.draw_idle()
+        if self.chk_barrier.isChecked():
+            eff_barrier = self.get_effective_barrier()
+            self.barrier_display.set_data(np.ma.masked_where(~eff_barrier[self.z], eff_barrier[self.z]))
+            self.barrier_display.set_alpha(0.3)
+            self.mip_barrier_display.set_data(np.ma.masked_where(~np.max(eff_barrier, axis=0), np.max(eff_barrier, axis=0)))
+            self.mip_barrier_display.set_alpha(0.2)
+            self.fig.canvas.draw_idle()
 
     def on_mouse_press(self, event):
         if self.toolbar.mode != '': return
@@ -732,7 +866,7 @@ class SpineAnalyzerApp(QMainWindow):
             self.is_drawing = True; self.paint(event)
         elif self.rb_target.isChecked() and event.inaxes in [self.ax1, self.ax2]:
             clicked_x, clicked_y = int(round(event.xdata)), int(round(event.ydata))
-            if event.button == 3: # Right Click Deletion
+            if event.button == 3: 
                 min_dist, to_remove = 12, None
                 for t in self.saved_targets:
                     dist = np.hypot(t['click_x'] - clicked_x, t['click_y'] - clicked_y)
@@ -744,7 +878,7 @@ class SpineAnalyzerApp(QMainWindow):
                     self.refresh_display()
                     self.log(f"🗑️ Removed Target [{to_remove['idx']}] at X:{to_remove['click_x']}, Y:{to_remove['click_y']}", clear=True)
                 return
-            if event.button == 1: # Left click 
+            if event.button == 1:  
                 self.click_x, self.click_y = clicked_x, clicked_y
                 opt_z, opt_y, opt_x = self.find_optimal_xyz(clicked_x, clicked_y, search_radius=5, start_z=self.z)
                 self.target_z, self.target_y, self.target_x = opt_z, opt_y, opt_x
@@ -907,7 +1041,7 @@ class SpineAnalyzerApp(QMainWindow):
                 self.rb_target.setChecked(True)
                 self.refresh_display()
 
-    # --- AUTOMAIC SEEDERS ---
+    # --- AUTOMATIC SEEDERS ---
     def auto_generate_seeds(self, silent=False):
         if self.raw_stack is None: return
         if not silent: self.log("🔍 Running background subtraction & geodesic filtering for auto-seeding...", clear=True)
@@ -922,7 +1056,7 @@ class SpineAnalyzerApp(QMainWindow):
         mip_img = np.max(self.raw_stack, axis=0)
         background = uniform_filter(mip_img.astype(float), size=50)
         bg_subtracted = np.clip(mip_img.astype(float) - background, 0, None)
-        smoothed = gaussian(bg_subtracted, sigma=1.5)
+        smoothed = gaussian_filter(bg_subtracted, sigma=1.5)
         
         if smoothed.max() > 0:
             binary_objects = smoothed > np.percentile(smoothed[smoothed > 0], 88)
@@ -957,7 +1091,7 @@ class SpineAnalyzerApp(QMainWindow):
         if base_name.endswith('.tif'): base_name = os.path.splitext(base_name)[0]
         
         suffix = "seeds_2-respan" if seed_type == 'seed2' else "seeds_3-respan"
-        matches = glob(os.path.join(dir_name, f"{base_name}*{suffix}*.csv")) or glob(os.path.join(dir_name, f"*{suffix}*.csv"))
+        matches = glob(os.path.join(dir_name, f"{base_name}*{suffix}*.csv")) 
         
         if not matches:
             self.log(f"⚠️ No CSV file found matching '*{suffix}*.csv' in the folder.", clear=True)
@@ -1063,7 +1197,6 @@ class SpineAnalyzerApp(QMainWindow):
             sub_stack = current_smoothed_stack[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
             lower_bound = max(seed_val * (1.0 - c_tol), 1e-6)
             
-            # --- 2D Base Segmentation & Dilation ---
             slice_2d = sub_stack[lz]
             binary_2d = slice_2d >= lower_bound
             if self.chk_hessian.isChecked():
@@ -1078,7 +1211,6 @@ class SpineAnalyzerApp(QMainWindow):
                 
             envelope_3d = np.broadcast_to(binary_dilation(binary_fill_holes(labeled_2d == labeled_2d[ly, lx]), iterations=3), sub_stack.shape)
             
-            # --- 3D Region Growing ---
             local_binary = sub_stack >= lower_bound
             if self.chk_hessian.isChecked():
                 blob_mask_3d = self.get_2d_hessian_blob_mask(sub_stack, self.val(self.lbl_strict), sig=self.val(self.lbl_sigma))
@@ -1166,9 +1298,19 @@ class SpineAnalyzerApp(QMainWindow):
             self.log(f"✅ Batch Analysis Complete! Processed {len(final_results_df)} targets. Saved to {os.path.basename(out_dir)}/")
 
     def is_valid_image(self, filename):
+        """Strictly filter out analysis outputs so they are never loaded as raw images."""
         fn = filename.lower()
-        if any(x in fn for x in ['geo', 'respan', 'mask', 'filtered', 'barrier']): 
-            return False
+        exclusions = [
+            '_dendrite-geo.tif', '_dendrite-geo.tiff',
+            '_dendrite-respan.tif', '_dendrite-respan.tiff',
+            '_segmentation_mask.tif', '_segmentation_mask.tiff',
+            '_filtered.tif', '_filtered.tiff',
+            '_custom_barrier_2d.tif', '_custom_barrier_2d.tiff',
+            '.swc', '.csv', '.png'
+        ]
+        for exc in exclusions:
+            if fn.endswith(exc):
+                return False
         return True
 
     def on_load_folder(self):
@@ -1232,9 +1374,21 @@ class SpineAnalyzerApp(QMainWindow):
         for idx in range(len(self.files)):
             self.load_image_at_index(idx)
             self.current_idx = idx
+            
+            if np.isinf(self.dist_field_3d).all():
+                self.log(f"⚠️ No mask found for {os.path.basename(self.files[idx])}. Auto-generating barrier...")
+                self.on_auto_generate_barrier()
+                
             self.auto_generate_seeds(silent=True)
             self.on_analyze_all(silent=True)
         self.log("🎉 Unattended batch completed successfully!")
+
+    def on_prev_image(self):
+        if self.current_idx > 0:
+            self.current_idx -= 1
+            self.load_image_at_index(self.current_idx)
+        else:
+            self.log("⚠️ Already at the first image in the queue!", clear=True)
 
     def on_next_image(self):
         if self.current_idx < len(self.files) - 1:
@@ -1244,7 +1398,18 @@ class SpineAnalyzerApp(QMainWindow):
             self.log("🎉 Completed all files in the queue!", clear=True)
 
 if __name__ == '__main__':
+    if os.name == 'nt':
+        myappid = 'ufscripps.intspine.analyzer.v1'
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except AttributeError:
+            pass
+
     app = QApplication(sys.argv)
+    icon_path = os.path.join(os.path.dirname(__file__), 'intspine_logo.png')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        
     window = SpineAnalyzerApp()
     window.show()
     sys.exit(app.exec())

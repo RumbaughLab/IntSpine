@@ -150,7 +150,4 @@ The tabular output provides comprehensive spatial and volumetric metrics for qua
 3. Can create an alignment process based on the segmented barrier
 
 4. Make new videos witht the updated UI
-=======
-## Future Improvements
-There are numerous opportunities for further development, including expanding this 2.5D framework into simpler, fully automated tools based on this manual ground-truth extraction pipeline.
->>>>>>> f6abc54c0ea679db32f9ab9b5de46ee8572520a0
+

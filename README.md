@@ -1,11 +1,9 @@
 
 <img src="intspine_logo.png" width="60" title="IntSpine" alt="IntSpine" align="left" vspace = "50">
 
-<<<<<<< HEAD
 #   `IntSpine`: <br>   `Int`eractive `Spine` Analysis Tool
-=======
 #   IntSpine: Interactive Spine Analysis Tool
->>>>>>> f6abc54c0ea679db32f9ab9b5de46ee8572520a0
+
  
 
 ## Overview

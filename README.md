@@ -93,7 +93,6 @@ Once the ROIs are cropped and extracted, loading them for labeling is  fast. Man
 ## Examples
 Example demonstration videos of the sandbox prototype of the pre-processing and UI workflow are available directly in this repository.
 
-<<<<<<< HEAD
 ## Output
 ### Output File Descriptions
 

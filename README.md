@@ -1,15 +1,15 @@
 
 <img src="intspine_logo.png" width="60" title="IntSpine" alt="IntSpine" align="left" vspace = "50">
 
-<<<<<<< HEAD
-#   `IntSpine`: <br>   `Int`eractive `Spine` Analysis Tool
-=======
-#   IntSpine: Interactive Spine Analysis Tool
->>>>>>> f6abc54c0ea679db32f9ab9b5de46ee8572520a0
- 
+# `IntSpine`: `Int`eractive `Spine` Analysis Tool
+
+<img src="intsegment_logo.png" width="60" title="IntSpine" alt="IntSpine" align="left" vspace = "50">
+
+# `IntSegment`: `Int`eractive `Segment`ation  Tool
+
 
 ## Overview
-This repository contains a standalone Python desktop application (PySide6) and associated tools for volumetric spine quantification from z-stack images. It was developed to benchmark automated solutions against ground truth data, as existing tools were not optimal for high-resolution datasets. 
+This repository contains 2 standalone Python desktop applications (PySide6) and associated tools for volumetric spine quantification from z-stack images. It was developed to benchmark automated solutions against ground truth data, as existing tools were not optimal for high-resolution datasets. 
 
 The application enables the easy extraction of volumes from z-stacks, facilitating manual annotation, eliminating z-axis bleeding, and improving data traceability.
 
@@ -95,7 +95,6 @@ Once the ROIs are cropped and extracted, loading them for labeling is  fast. Man
 ## Examples
 Example demonstration videos of the sandbox prototype of the pre-processing and UI workflow are available directly in this repository.
 
-<<<<<<< HEAD
 ## Output
 ### Output File Descriptions
 
@@ -153,7 +152,5 @@ The tabular output provides comprehensive spatial and volumetric metrics for qua
 3. Can create an alignment process based on the segmented barrier
 
 4. Make new videos witht the updated UI
-=======
 ## Future Improvements
 There are numerous opportunities for further development, including expanding this 2.5D framework into simpler, fully automated tools based on this manual ground-truth extraction pipeline.
->>>>>>> f6abc54c0ea679db32f9ab9b5de46ee8572520a0

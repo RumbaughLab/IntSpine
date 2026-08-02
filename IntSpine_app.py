@@ -261,6 +261,15 @@ class SpineAnalyzerApp(QMainWindow):
         mode_lyt.addWidget(self.rb_erase)
         set_lyt.addLayout(mode_lyt)
         
+        # --- NEW: Snapping Toggle & Radius Slider ---
+        self.chk_snap = QCheckBox("Auto-Snap Click to Peak")
+        self.chk_snap.setChecked(False) 
+        set_lyt.addWidget(self.chk_snap)
+        
+        self.sld_snap, self.lbl_snap = self.create_slider("Snap Radius (px)", 1, 30, 5, 1)
+        set_lyt.addLayout(self.sld_snap)
+        # --------------------------------------------
+
         self.sld_brush, self.lbl_brush = self.create_slider("Brush Size", 2, 40, 8, 1)
         paint_btn_lyt = QHBoxLayout()
         self.btn_clear_paint = QPushButton("Clear Paint")
@@ -484,7 +493,6 @@ class SpineAnalyzerApp(QMainWindow):
                 total_length += dist
         return dist_3d, total_length
 
-    # --- AUTO BARRIER GENERATOR ---
     def on_auto_generate_barrier(self):
         if self.raw_stack is None:
             self.log("⚠️ No image loaded to generate barrier.", clear=True)
@@ -571,7 +579,6 @@ class SpineAnalyzerApp(QMainWindow):
             else:
                 self.log("⚠️ No SWC file found. Default barrier disabled.")
         else:
-            # STRICT GLOB: Only matches files that explicitly start with the image's base_name
             pattern = "*geo*.tif*" if val == 'Geo Mask' else "*respan*.tif*"
             matches = glob(os.path.join(dir_name, f"{base_name}{pattern}"))
             
@@ -580,7 +587,6 @@ class SpineAnalyzerApp(QMainWindow):
                 self.log(f"✅ Found {val} file: {os.path.basename(mask_file)}")
                 loaded_mask = imread(mask_file) > 0
                 
-                # STRICT SHAPE CHECK: Protects against ValueErrors when masks and raw images are cropped differently
                 if loaded_mask.shape[-2:] != self.raw_stack.shape[-2:]:
                     self.log(f"⚠️ Mask shape {loaded_mask.shape} mismatches image {self.raw_stack.shape}. Ignoring mask.")
                 else:
@@ -657,7 +663,6 @@ class SpineAnalyzerApp(QMainWindow):
         for disp in [self.img_display, self.barrier_display, self.mask_display, self.mip_display, self.mip_barrier_display, self.mip_mask_display]:
             disp.set_extent(extent)
             
-        # FORCE BUFFER FLUSH: Instantly clear visuals with invisible zeros
         empty = np.zeros((h, w))
         for disp in [self.barrier_display, self.mip_barrier_display, self.mask_display, self.mip_mask_display]:
             disp.set_data(empty)
@@ -754,7 +759,6 @@ class SpineAnalyzerApp(QMainWindow):
         self.img_display.set_data(self.raw_stack[z])
         self.update_contrast()
         
-        # --- BARRIER OVERLAY UPDATE (Ghosting Fix) ---
         if self.chk_barrier.isChecked():
             eff_barrier = self.get_effective_barrier()
             barrier_z = eff_barrier[z]
@@ -779,7 +783,6 @@ class SpineAnalyzerApp(QMainWindow):
             self.mip_barrier_display.set_data(np.zeros_like(self.raw_stack[0]))
             self.mip_barrier_display.set_alpha(0.0)
         
-        # --- MASK/SEGMENT OVERLAY UPDATE (Ghosting Fix) ---
         if self.chk_segment.isChecked():
             z_mask = self.mask[z] > 0
             mip_m = np.max(self.mask, axis=0) > 0
@@ -803,7 +806,6 @@ class SpineAnalyzerApp(QMainWindow):
             self.mip_mask_display.set_data(np.zeros_like(self.raw_stack[0]))
             self.mip_mask_display.set_alpha(0.0)
         
-        # --- CLEAR & REDRAW MARKERS ---
         for item in self.texts_ax1 + self.texts_ax2 + self.dots_ax1 + self.dots_ax2:
             try: item.remove()
             except: pass
@@ -880,7 +882,10 @@ class SpineAnalyzerApp(QMainWindow):
                 return
             if event.button == 1:  
                 self.click_x, self.click_y = clicked_x, clicked_y
-                opt_z, opt_y, opt_x = self.find_optimal_xyz(clicked_x, clicked_y, search_radius=5, start_z=self.z)
+                
+                search_rad = int(self.val(self.lbl_snap)) if self.chk_snap.isChecked() else 0
+                opt_z, opt_y, opt_x = self.find_optimal_xyz(clicked_x, clicked_y, search_radius=search_rad, start_z=self.z)
+                
                 self.target_z, self.target_y, self.target_x = opt_z, opt_y, opt_x
                 self.z = opt_z
                 self.refresh_display()
@@ -1072,7 +1077,7 @@ class SpineAnalyzerApp(QMainWindow):
                 if dist_field_2d[y_loc, x_loc] > max_geo_dist:
                     filtered_count += 1
                     continue
-                opt_z, opt_y, opt_x = self.find_optimal_xyz(x_loc, y_loc, search_radius=5, start_z=None)
+                opt_z, opt_y, opt_x = self.find_optimal_xyz(x_loc, y_loc, search_radius=int(self.val(self.lbl_snap)), start_z=None)
                 
                 idx = self.target_counter; status = 'new'
                 label_text = f"[{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x} ({status})"
@@ -1119,7 +1124,7 @@ class SpineAnalyzerApp(QMainWindow):
                 x_loc, y_loc = int(round(row[x_col])), int(round(row[y_col]))
                 if not (0 <= y_loc < self.raw_stack.shape[1] and 0 <= x_loc < self.raw_stack.shape[2]): continue
                     
-                opt_z, opt_y, opt_x = self.find_optimal_xyz(x_loc, y_loc, search_radius=5, start_z=None)
+                opt_z, opt_y, opt_x = self.find_optimal_xyz(x_loc, y_loc, search_radius=int(self.val(self.lbl_snap)), start_z=None)
                 idx = self.target_counter; status = 'new'
                 label_text = f"[{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x} ({status})"
                 self.saved_targets.append({'idx': idx, 'label': label_text, 'z': opt_z, 'y': opt_y, 'x': opt_x,
@@ -1298,7 +1303,6 @@ class SpineAnalyzerApp(QMainWindow):
             self.log(f"✅ Batch Analysis Complete! Processed {len(final_results_df)} targets. Saved to {os.path.basename(out_dir)}/")
 
     def is_valid_image(self, filename):
-        """Strictly filter out analysis outputs so they are never loaded as raw images."""
         fn = filename.lower()
         exclusions = [
             '_dendrite-geo.tif', '_dendrite-geo.tiff',

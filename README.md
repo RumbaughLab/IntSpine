@@ -43,6 +43,9 @@ cd /path/to/IntSpine
 # Create the environment
 conda env create -f environment.yml
 
+# Create the environment (optional)
+conda env update --file environment.yml --prune
+
 # Activate the environment
 conda activate IntSpine
 ```
@@ -54,17 +57,15 @@ python IntSpine_app.py
 
 ## Workflow
 
-![IntSpine User Interface](assets/UI1_screenshot.png)
-*IntSpine User Interface*
-
-### 0. Pre-Processing & ROI Extraction
+### Manual extraction (deprecated -  see 2. IntSegment)
+#### 0. Pre-Processing & ROI Extraction 
 This step enables the extraction of images to implement batch processing and traceability of the data
 1. Open a **z-max projection** of your z-stack. This is significantly faster to load than a full z-stack and makes it much easier to identify branches of interest.
 2. Draw and save Regions of Interest (ROIs) on the z-projection (Fiji)
 3. Run the automated extraction tool `tile_generation.ipynb`. *(Note: Loading the full image—e.g., 500 z-steps—takes about 1 minute, but this process runs entirely automatically).*
 4. The tool will automatically extract and crop all ROIs in X, Y, and Z dimensions.
 
-### 1. Tracing and Masking
+#### 1. Tracing and Masking
 Once the ROIs are cropped and extracted, loading them for labeling is  fast. Manual tracing and saving of the trace with SNT as swc format can be performed however this process is automated within IntSpine and is not require. In addition, traces or mask from other software can be uploaded as well.
 1. Load the extracted ROI segments.
 2. Trace the neurite using **SNT (Simple Neurite Tracer)**.
@@ -72,7 +73,15 @@ Once the ROIs are cropped and extracted, loading them for labeling is  fast. Man
 4. **Diameter Masking**: While tracing the neurite, use the scroll wheel to adjust and capture the *actual diameter* of the dendrite. This trace acts as a spatial barrier during z-quantification.
 5. Save the completed trace as an `.swc` file (or generate a Geo/Respan mask).
 
+### 2. Automatic Branch extraction and  Quantification (IntSegment App)
+<img src="assets/UI2_screenshot.png" alt="IntSegment User Interface" width="800">   
+*IntSpine User Interface*
+
 ### 3. Volumetric Quantification (IntSpine App)
+<img src="assets/UI1_screenshot.png" alt="IntSpine User Interface" width="800">   
+*IntSpine User Interface*
+
+
 1. **Load Data:** Launch `IntSpine_app.py`. Click **Browse Folder** to select the directory containing your cropped `.tif` images and their corresponding masks/traces. Click **Load Remaining**.
 
 2. **Select Mask Source:** Choose the appropriate barrier mask (`SWC Mask`, `Geo Mask`, or `Respan Mask`) from the dropdown. Adjust the **Barrier µm** slider to dilate or contract the dendritic exclusion zone.

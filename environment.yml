@@ -11,3 +11,5 @@ dependencies:
   - scikit-image
   - tifffile
   - pyside6
+  - h5py
+  - scikit-learn

@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QShortcut, QKeySequence, QIcon
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -80,6 +82,13 @@ def dilate_reskeletonize_and_find_nodes(pruned_skeleton):
     ultra_smooth_skeleton = skeletonize(dilated_paths)
     
     kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 1, 1]])
+    
+    # Prune tiny hairs/spurs (up to 5 pixels) created by the second skeletonization
+    for _ in range(5):
+        neighbor_count = convolve(ultra_smooth_skeleton.astype(int), kernel, mode='constant')
+        ultra_smooth_skeleton[(neighbor_count == 11) & ultra_smooth_skeleton] = False
+        
+    # Recompute neighbor count after cleaning up the skeleton
     neighbor_count = convolve(ultra_smooth_skeleton.astype(int), kernel, mode='constant')
     endpoints_coords = np.argwhere((neighbor_count == 11) & ultra_smooth_skeleton)
     
@@ -214,11 +223,21 @@ class BatchProcessorThread(QThread):
                 if base_name.endswith('.tif'): base_name = os.path.splitext(base_name)[0]
                 h5_path = os.path.join(out_dir, f"{base_name}_extracted.h5")
                 
+                selected_props = []
                 with h5py.File(h5_path, 'w') as h5f:
                     h5f.attrs['soma_x'] = soma_loc[1]
                     h5f.attrs['soma_y'] = soma_loc[0]
                     h5f.attrs['total_smooth_skeleton_length_px'] = total_smooth_length
                     h5f.attrs['total_intersections'] = num_intersections
+                    
+                    h5f.attrs['min_length'] = self.params['min_length']
+                    h5f.attrs['bbox_padding'] = self.params['bbox_padding']
+                    h5f.attrs['soma_window'] = self.params['soma_window']
+                    h5f.attrs['max_soma_dist'] = self.params['max_soma_dist']
+                    h5f.attrs['dist_filter'] = self.params['dist_filter']
+                    h5f.attrs['show_low'] = self.params.get('show_low', True)
+                    h5f.attrs['show_med'] = self.params.get('show_med', True)
+                    h5f.attrs['show_high'] = self.params.get('show_high', True)
                     
                     h5f.create_dataset("mip", data=mip, compression="gzip")
                     h5f.create_dataset("smooth_skeleton", data=smooth_skeleton, compression="gzip")
@@ -260,6 +279,7 @@ class BatchProcessorThread(QThread):
                         grp.attrs['soma_dist'] = dist_soma
                         
                         if is_selected:
+                            selected_props.append((prop, cluster_id, int_class))
                             all_results.append({
                                 'File': base_name, 'Seg_ID': seg_id,
                                 'Length_px': prop.area, 'Intensity': int_class,
@@ -268,6 +288,65 @@ class BatchProcessorThread(QThread):
                                 'Min_Len_Param': self.params['min_length'], 'Max_Dist_Param': self.params['max_soma_dist'],
                                 'Dist_Filter': self.params['dist_filter']
                             })
+                            
+                # --- GENERATE PNG FOR SELECTED SEGMENTS OVERLAY ---
+                fig = Figure(figsize=(12, 12), facecolor='black')
+                canvas = FigureCanvasAgg(fig)
+                ax = fig.add_subplot(111)
+                ax.set_facecolor('black')
+                ax.axis('off')
+
+                p_low = np.percentile(mip, 2)
+                p_high = np.percentile(mip, 99.5)
+                vmax_pop = max(p_low + 1, p_high * 1.2)
+                ax.imshow(mip, cmap='gray', vmin=p_low, vmax=vmax_pop)
+
+                visual_cluster_mask = np.zeros_like(healed_labeled_skeleton)
+                visual_segments = expand_labels(healed_labeled_skeleton, distance=2)
+                for prop, c_id, _ in selected_props:
+                    visual_cluster_mask[visual_segments == prop.label] = c_id + 1
+
+                custom_colors = [[0, 0, 0, 0], [0, 1, 1, 1.0], [1, 1, 0, 1.0], [1, 0.2, 0.2, 1.0]]
+                intensity_cmap = ListedColormap(custom_colors)
+                masked_visuals = np.ma.masked_where(visual_cluster_mask == 0, visual_cluster_mask)
+                ax.imshow(masked_visuals, cmap=intensity_cmap, interpolation='nearest', vmin=0, vmax=3)
+
+                for prop, _, _ in selected_props:
+                    geom_center = prop.centroid
+                    distances = np.sum((prop.coords - geom_center)**2, axis=1)
+                    mid_y, mid_x = prop.coords[np.argmin(distances)]
+                    ax.text(mid_x, mid_y, str(prop.label), color='white', fontsize=10, 
+                            fontweight='bold', ha='center', va='center', 
+                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='white', pad=1.5, linewidth=0.8))
+
+                if len(true_forks) > 0:
+                    ax.scatter(true_forks[:, 1], true_forks[:, 0], color='cyan', s=45, zorder=5)
+                if len(endpoints) > 0:
+                    ax.scatter(endpoints[:, 1], endpoints[:, 0], color='red', s=45, zorder=6)
+                    
+                ax.scatter(soma_loc[1], soma_loc[0], color='white', marker='*', s=250, edgecolors='black', zorder=10)
+                dist_circle = patches.Circle((soma_loc[1], soma_loc[0]), self.params['max_soma_dist'], 
+                                             color='white', fill=False, linestyle='--', linewidth=2, alpha=0.7)
+                ax.add_patch(dist_circle)
+
+                legend_elements = [
+                    Line2D([0], [0], marker='*', color='w', markerfacecolor='white', markeredgecolor='k', markersize=12, label='Soma Origin'),
+                    Line2D([0], [0], color='w', linestyle='--', linewidth=2, label='Max Distance Threshold'),
+                    Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=8, label='Endpoints'),
+                    Line2D([0], [0], marker='o', color='w', markerfacecolor='cyan', markersize=8, label='Forks'),
+                    patches.Patch(color=[0, 1, 1], label='Low Intensity'),
+                    patches.Patch(color=[1, 1, 0], label='Medium Intensity'),
+                    patches.Patch(color=[1, 0.2, 0.2], label='High Intensity')
+                ]
+                ax.legend(handles=legend_elements, loc='upper right', framealpha=0.9, facecolor='black', edgecolor='white', labelcolor='white', fontsize=12)
+
+                ax.set_xlim(0, mip.shape[1])
+                ax.set_ylim(mip.shape[0], 0)
+                fig.subplots_adjust(bottom=0, top=1, left=0, right=1)
+                
+                png_path = os.path.join(out_dir, f"{base_name}_overlay.png")
+                fig.savefig(png_path, dpi=150, facecolor='black', bbox_inches='tight')
+
             except Exception as e:
                 self.progress.emit(idx, f"Error on {os.path.basename(filepath)}:\n{traceback.format_exc()}")
                 
@@ -650,6 +729,55 @@ class SpineExtractionApp(QMainWindow):
             try:
                 with h5py.File(h5_path, 'r') as h5f:
                     self.soma_loc = (h5f.attrs['soma_y'], h5f.attrs['soma_x'])
+                    
+                    if 'min_length' in h5f.attrs:
+                        self.sld_min_len.blockSignals(True)
+                        val = int(h5f.attrs['min_length'])
+                        self.sld_min_len.setValue(val)
+                        self.lyt_min_len.itemAt(2).widget().setText(str(val))
+                        self.sld_min_len.blockSignals(False)
+                        
+                    if 'bbox_padding' in h5f.attrs:
+                        self.sld_pad.blockSignals(True)
+                        val = int(h5f.attrs['bbox_padding'])
+                        self.sld_pad.setValue(val)
+                        self.lyt_pad.itemAt(2).widget().setText(str(val))
+                        self.sld_pad.blockSignals(False)
+                        
+                    if 'soma_window' in h5f.attrs:
+                        self.sld_soma.blockSignals(True)
+                        val = int(h5f.attrs['soma_window'])
+                        self.sld_soma.setValue(val)
+                        self.lyt_soma.itemAt(2).widget().setText(str(val))
+                        self.sld_soma.blockSignals(False)
+                        
+                    if 'max_soma_dist' in h5f.attrs:
+                        self.sld_max_dist.blockSignals(True)
+                        val = int(h5f.attrs['max_soma_dist'])
+                        self.sld_max_dist.setValue(val)
+                        self.lyt_max_dist.itemAt(2).widget().setText(str(val))
+                        self.sld_max_dist.blockSignals(False)
+                        
+                    if 'dist_filter' in h5f.attrs:
+                        self.combo_dist_filter.blockSignals(True)
+                        self.combo_dist_filter.setCurrentText(str(h5f.attrs['dist_filter']))
+                        self.combo_dist_filter.blockSignals(False)
+                        
+                    if 'show_low' in h5f.attrs:
+                        self.chk_int_low.blockSignals(True)
+                        self.chk_int_low.setChecked(bool(h5f.attrs['show_low']))
+                        self.chk_int_low.blockSignals(False)
+                        
+                    if 'show_med' in h5f.attrs:
+                        self.chk_int_med.blockSignals(True)
+                        self.chk_int_med.setChecked(bool(h5f.attrs['show_med']))
+                        self.chk_int_med.blockSignals(False)
+                        
+                    if 'show_high' in h5f.attrs:
+                        self.chk_int_high.blockSignals(True)
+                        self.chk_int_high.setChecked(bool(h5f.attrs['show_high']))
+                        self.chk_int_high.blockSignals(False)
+
                     self.smooth_skeleton = h5f['smooth_skeleton'][:]
                     self.healed_skeleton = h5f['healed_skeleton'][:]
                     self.test_forks = h5f['true_forks'][:]
